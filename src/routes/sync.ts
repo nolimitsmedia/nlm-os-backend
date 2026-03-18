@@ -15,11 +15,19 @@ function env(name: string, fallback = "") {
 }
 
 function hasWhmcsConfig() {
-  return Boolean(
+  const hasModernPair = Boolean(
     env("WHMCS_API_URL") &&
     env("WHMCS_API_IDENTIFIER") &&
     env("WHMCS_API_SECRET"),
   );
+
+  const hasLegacyPair = Boolean(
+    env("WHMCS_API_URL") &&
+    env("WHMCS_API_USERNAME") &&
+    env("WHMCS_API_ACCESS_KEY"),
+  );
+
+  return hasModernPair || hasLegacyPair;
 }
 
 function parseBool(value: any, fallback = false) {
@@ -97,6 +105,12 @@ router.get("/health", async (_req, res) => {
       whmcs_sync_page_size: Number(env("WHMCS_SYNC_PAGE_SIZE", "250")),
       whmcs_sync_timeout_ms: Number(env("WHMCS_SYNC_TIMEOUT_MS", "30000")),
       whmcs_sync_client_status: env("WHMCS_SYNC_CLIENT_STATUS") || null,
+      whmcs_auth_mode:
+        env("WHMCS_API_IDENTIFIER") && env("WHMCS_API_SECRET")
+          ? "identifier_secret"
+          : env("WHMCS_API_USERNAME") && env("WHMCS_API_ACCESS_KEY")
+            ? "username_access_key"
+            : null,
       ...getWhmcsAutoSyncConfig(),
     };
 
@@ -203,7 +217,7 @@ router.post("/whmcs/run", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error:
-          "WHMCS is not configured. Missing WHMCS_API_URL, WHMCS_API_IDENTIFIER, or WHMCS_API_SECRET.",
+          "WHMCS is not configured. Provide WHMCS_API_URL plus either WHMCS_API_IDENTIFIER/WHMCS_API_SECRET or WHMCS_API_USERNAME/WHMCS_API_ACCESS_KEY.",
       });
     }
 

@@ -3,6 +3,80 @@ import { query } from "../db.js";
 
 type RunRow = { id: string };
 
+function firstEnv(names: string[], optional = false) {
+  for (const name of names) {
+    const value = String(process.env[name] ?? "").trim();
+    if (value) return value;
+  }
+  if (!optional) {
+    throw new Error(`${names[0]} is not set (services/api/.env)`);
+  }
+  return "";
+}
+
+function parseWhmcsBlockedIp(message: string) {
+  const match = String(message || "").match(/Invalid IP\s+([0-9.]+)/i);
+  return match?.[1] || null;
+}
+
+function buildWhmcsAuthFields() {
+  const identifier = firstEnv(["WHMCS_API_IDENTIFIER"], true);
+  const secret = firstEnv(["WHMCS_API_SECRET"], true);
+
+  if (identifier && secret) {
+    return {
+      mode: "identifier-secret" as const,
+      fields: {
+        identifier,
+        secret,
+      },
+    };
+  }
+
+  const username = firstEnv(
+    ["WHMCS_API_USERNAME", "WHMCS_ADMIN_USERNAME"],
+    true,
+  );
+  const accessKey = firstEnv(
+    ["WHMCS_API_ACCESS_KEY", "WHMCS_ACCESS_KEY"],
+    true,
+  );
+
+  if (username && accessKey) {
+    return {
+      mode: "username-accesskey" as const,
+      fields: {
+        username,
+        accesskey: accessKey,
+      },
+    };
+  }
+
+  throw new Error(
+    "WHMCS credentials are not set. Provide WHMCS_API_IDENTIFIER + WHMCS_API_SECRET or WHMCS_API_USERNAME + WHMCS_API_ACCESS_KEY.",
+  );
+}
+
+function normalizeWhmcsError(
+  action: string,
+  status: number,
+  payload: any,
+  rawText: string,
+) {
+  const payloadText = payload
+    ? JSON.stringify(payload).slice(0, 700)
+    : String(rawText || "").slice(0, 700);
+  const invalidIp = parseWhmcsBlockedIp(payloadText);
+
+  if (status === 403 && invalidIp) {
+    return new Error(
+      `WHMCS blocked this server IP (${invalidIp}) for action ${action}. Check the exact API credential pair in WHMCS API IP Access Restriction, then verify Trusted Proxies if WHMCS is behind a proxy/load balancer. Raw WHMCS response: ${payloadText}`,
+    );
+  }
+
+  return new Error(`WHMCS HTTP ${status}: ${payloadText}`);
+}
+
 function env(name: string, optional = false) {
   const v = process.env[name];
   if (!v && !optional) {
@@ -214,6 +288,8 @@ async function ensureServicesCacheTable() {
       status           TEXT NOT NULL,
       recurring_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
       billing_cycle    TEXT,
+      product_name     TEXT,
+      domain           TEXT,
       next_due_date    TIMESTAMPTZ,
       raw              JSONB NOT NULL DEFAULT '{}'::jsonb,
       last_synced_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -227,6 +303,8 @@ async function ensureServicesCacheTable() {
     ADD COLUMN IF NOT EXISTS status TEXT,
     ADD COLUMN IF NOT EXISTS recurring_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS billing_cycle TEXT,
+    ADD COLUMN IF NOT EXISTS product_name TEXT,
+    ADD COLUMN IF NOT EXISTS domain TEXT,
     ADD COLUMN IF NOT EXISTS next_due_date TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now();
@@ -311,18 +389,20 @@ function isUtf8JsonErrorMessage(message: string) {
 
 async function whmcsCall<T = any>(action: string, params: Record<string, any>) {
   const url = env("WHMCS_API_URL");
-  const identifier = env("WHMCS_API_IDENTIFIER");
-  const secret = env("WHMCS_API_SECRET");
   const timeoutMs = envNum("WHMCS_SYNC_TIMEOUT_MS", 30000);
+  const auth = buildWhmcsAuthFields();
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const body = new URLSearchParams();
   body.set("action", action);
-  body.set("identifier", identifier);
-  body.set("secret", secret);
   body.set("responsetype", "json");
+
+  for (const [k, v] of Object.entries(auth.fields)) {
+    if (v === undefined || v === null || v === "") continue;
+    body.set(k, String(v));
+  }
 
   for (const [k, v] of Object.entries(params || {})) {
     if (v === undefined || v === null || v === "") continue;
@@ -332,7 +412,12 @@ async function whmcsCall<T = any>(action: string, params: Record<string, any>) {
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json, text/plain, */*",
+        "User-Agent": "NLM-OS-WHMCS-Sync/1.0",
+        "X-Requested-With": "XMLHttpRequest",
+      },
       body,
       signal: controller.signal,
     });
@@ -344,18 +429,23 @@ async function whmcsCall<T = any>(action: string, params: Record<string, any>) {
       json = text ? JSON.parse(text) : null;
     } catch {
       throw new Error(
-        `WHMCS response not JSON (${res.status}): ${text.slice(0, 400)}`,
+        `WHMCS response not JSON (${res.status}) for action ${action}: ${text.slice(0, 400)}`,
       );
     }
 
     if (!res.ok) {
-      throw new Error(
-        `WHMCS HTTP ${res.status}: ${JSON.stringify(json).slice(0, 400)}`,
-      );
+      throw normalizeWhmcsError(action, res.status, json, text);
     }
 
     if (json?.result && String(json.result).toLowerCase() === "error") {
-      throw new Error(`WHMCS error [${action}]: ${json?.message || "unknown"}`);
+      const message = String(json?.message || "unknown");
+      const invalidIp = parseWhmcsBlockedIp(message);
+      if (invalidIp) {
+        throw new Error(
+          `WHMCS blocked this server IP (${invalidIp}) for action ${action}. Check the exact API credential pair in WHMCS API IP Access Restriction, then verify Trusted Proxies if WHMCS is behind a proxy/load balancer. Raw WHMCS response: ${JSON.stringify(json).slice(0, 700)}`,
+        );
+      }
+      throw new Error(`WHMCS error [${action}]: ${message}`);
     }
 
     return json as T;
@@ -558,24 +648,43 @@ async function upsertServiceCache(whmcsClientId: number, row: any) {
     row?.recurringamount ?? row?.recurring_amount ?? row?.amount,
   );
   const billingCycle = row?.billingcycle ?? row?.billing_cycle ?? null;
+  const productName =
+    row?.productname ??
+    row?.product_name ??
+    row?.name ??
+    row?.package_name ??
+    null;
+  const domain = row?.domain ?? null;
   const nextDue = toIsoOrNull(row?.nextduedate ?? row?.next_due_date);
 
   await query(
     `
     INSERT INTO whmcs_services_cache
-      (service_id, whmcs_client_id, status, recurring_amount, billing_cycle, next_due_date, raw, last_synced_at)
+      (service_id, whmcs_client_id, status, recurring_amount, billing_cycle, product_name, domain, next_due_date, raw, last_synced_at)
     VALUES
-      ($1, $2, $3, $4, $5, $6, $7::jsonb, now())
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, now())
     ON CONFLICT (service_id) DO UPDATE SET
       whmcs_client_id=EXCLUDED.whmcs_client_id,
       status=EXCLUDED.status,
       recurring_amount=EXCLUDED.recurring_amount,
       billing_cycle=EXCLUDED.billing_cycle,
+      product_name=EXCLUDED.product_name,
+      domain=EXCLUDED.domain,
       next_due_date=EXCLUDED.next_due_date,
       raw=EXCLUDED.raw,
       last_synced_at=now()
     `,
-    [serviceId, whmcsClientId, status, recurring, billingCycle, nextDue, row],
+    [
+      serviceId,
+      whmcsClientId,
+      status,
+      recurring,
+      billingCycle,
+      productName,
+      domain,
+      nextDue,
+      row,
+    ],
   );
 }
 
