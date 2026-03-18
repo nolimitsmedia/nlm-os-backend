@@ -1,3 +1,4 @@
+// services/api/src/routes/sharepoint.ts
 import { Router } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
@@ -22,7 +23,21 @@ const upload = multer({
 
 router.get("/status", requireAuth, async (_req, res) => {
   try {
-    return res.json(getSharePointStatus());
+    const status = getSharePointStatus();
+    return res.json({
+      ...status,
+      recommendations: [
+        !status.configured
+          ? "Add Microsoft Graph tenant, client ID, and client secret."
+          : null,
+        !status.defaultSiteId
+          ? "Set a default SharePoint site ID for faster browsing."
+          : null,
+        !status.defaultDriveId
+          ? "Set a default SharePoint drive ID to preselect the document library."
+          : null,
+      ].filter(Boolean),
+    });
   } catch (e: any) {
     return res.status(500).json({
       ok: false,
@@ -129,6 +144,34 @@ router.post("/upload", requireAuth, upload.single("file"), async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: e?.message || "Failed to upload SharePoint file",
+    });
+  }
+});
+
+router.get("/workspace-summary", requireAuth, async (req, res) => {
+  try {
+    const siteId = String(req.query.siteId || "").trim();
+    const driveId = String(req.query.driveId || "").trim();
+    const status = getSharePointStatus();
+    const sites = await listSites("").catch(() => []);
+    const drives = await listDrives(siteId).catch(() => []);
+    const rootItems = driveId
+      ? await listItems({ siteId, driveId, path: "/" }).catch(() => [])
+      : [];
+
+    return res.json({
+      ok: true,
+      status,
+      summary: {
+        site_count: Array.isArray(sites) ? sites.length : 0,
+        drive_count: Array.isArray(drives) ? drives.length : 0,
+        root_item_count: Array.isArray(rootItems) ? rootItems.length : 0,
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to load SharePoint workspace summary",
     });
   }
 });

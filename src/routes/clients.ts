@@ -39,6 +39,29 @@ function extractWhmcsIdFromSyntheticId(value: string) {
   return match ? Number(match[1]) : null;
 }
 
+function computeBillingStatus(balanceDue: number, overdueInvoices: number) {
+  if (overdueInvoices > 0) return "overdue";
+  if (balanceDue > 0) return "due";
+  return "good";
+}
+
+function computeRiskScore(args: {
+  balanceDue: number;
+  overdueInvoices: number;
+  activeServices: number;
+}) {
+  const score = Math.min(
+    100,
+    Number(args.overdueInvoices || 0) * 35 +
+      (Number(args.balanceDue || 0) > 0 ? 15 : 0) +
+      (Number(args.activeServices || 0) === 0 ? 15 : 0),
+  );
+
+  if (score >= 70) return { score, band: "high" };
+  if (score >= 35) return { score, band: "medium" };
+  return { score, band: "healthy" };
+}
+
 router.get("/", async (req, res) => {
   const search = String(req.query?.search || "")
     .trim()
@@ -145,17 +168,35 @@ router.get("/", async (req, res) => {
       `,
     );
 
-    const rows = (r.rows || []).map((row: any) => ({
-      ...row,
-      mrr: toMoney(row.mrr),
-      balance_due: toMoney(row.balance_due),
-      open_invoices: toInt(row.open_invoices),
-      overdue_invoices: toInt(row.overdue_invoices),
-      active_services: toInt(row.active_services),
-      is_whmcs_synced: Boolean(row.whmcs_client_id),
-      is_local_manual: !row.whmcs_client_id || row.source === "local",
-      source_label: row.whmcs_client_id ? "WHMCS Synced" : "Local / Manual",
-    }));
+    const rows = (r.rows || []).map((row: any) => {
+      const balanceDue = toMoney(row.balance_due);
+      const overdueInvoices = toInt(row.overdue_invoices);
+      const activeServices = toInt(row.active_services);
+      const risk = computeRiskScore({
+        balanceDue,
+        overdueInvoices,
+        activeServices,
+      });
+
+      return {
+        ...row,
+        mrr: toMoney(row.mrr),
+        balance_due: balanceDue,
+        open_invoices: toInt(row.open_invoices),
+        overdue_invoices: overdueInvoices,
+        active_services: activeServices,
+        is_whmcs_synced: Boolean(row.whmcs_client_id),
+        is_local_manual: !row.whmcs_client_id || row.source === "local",
+        source_label: row.whmcs_client_id ? "WHMCS Synced" : "Local / Manual",
+        billing_source_label: row.whmcs_client_id
+          ? "WHMCS / QuickBooks Ready"
+          : "Local / Manual",
+        primary_contact_email: row.whmcs_email || null,
+        billing_status: computeBillingStatus(balanceDue, overdueInvoices),
+        risk_score: risk.score,
+        risk_band: risk.band,
+      };
+    });
 
     const filtered = !search
       ? rows
@@ -170,6 +211,8 @@ router.get("/", async (req, res) => {
             row.whmcs_status,
             row.source,
             row.source_label,
+            row.billing_status,
+            row.risk_band,
           ]
             .map((v) => String(v ?? "").toLowerCase())
             .join(" ");
@@ -280,8 +323,8 @@ router.get("/:id", async (req, res) => {
           AND w.whmcs_client_id = $2::int
           AND NOT EXISTS (
             SELECT 1
-            FROM clients c
-            WHERE c.whmcs_client_id = w.whmcs_client_id
+            FROM clients c2
+            WHERE c2.whmcs_client_id = w.whmcs_client_id
           )
         LIMIT 1
       )
@@ -296,24 +339,42 @@ router.get("/:id", async (req, res) => {
     const row = r.rows[0];
     if (!row) return res.status(404).json({ error: "Client not found" });
 
-    const displayName = row.name || row.whmcs_company_name || row.id;
     const seed = row.whmcs_client_id
       ? Number(row.whmcs_client_id)
       : hashNum(row.id);
+    const displayName = row.name || row.whmcs_company_name || row.id;
+    const balanceDue = row.whmcs_client_id ? toMoney(row.balance_due) : 0;
+    const overdueInvoices = row.whmcs_client_id
+      ? toInt(row.overdue_invoices)
+      : 0;
+    const activeServices = row.whmcs_client_id ? toInt(row.active_services) : 0;
+    const risk = computeRiskScore({
+      balanceDue,
+      overdueInvoices,
+      activeServices,
+    });
 
     const summary = {
       mrr: row.whmcs_client_id ? toMoney(row.mrr) : (seed % 25) * 25,
-      balance_due: row.whmcs_client_id
-        ? toMoney(row.balance_due)
-        : (seed % 7) * 40,
+      balance_due: balanceDue,
       open_invoices: row.whmcs_client_id ? toInt(row.open_invoices) : seed % 6,
-      overdue_invoices: row.whmcs_client_id
-        ? toInt(row.overdue_invoices)
-        : seed % 3,
+      overdue_invoices: overdueInvoices,
       open_tickets: row.whmcs_client_id ? seed % 5 : 0,
       active_projects: row.whmcs_client_id ? seed % 4 : 0,
-      active_services: row.whmcs_client_id ? toInt(row.active_services) : 0,
+      active_services: activeServices,
     };
+
+    const flags = [
+      ...(summary.overdue_invoices > 0
+        ? [
+            `${summary.overdue_invoices} overdue invoice${summary.overdue_invoices === 1 ? "" : "s"}`,
+          ]
+        : []),
+      ...(summary.balance_due > 0
+        ? [`Balance due ${summary.balance_due.toLocaleString()}`]
+        : []),
+      ...(summary.active_services === 0 ? ["No active services"] : []),
+    ];
 
     res.json({
       id: row.id,
@@ -323,6 +384,17 @@ router.get("/:id", async (req, res) => {
         (row.whmcs_status ? String(row.whmcs_status).toLowerCase() : "active"),
       source: row.source,
       source_label: row.whmcs_client_id ? "WHMCS Synced" : "Local / Manual",
+      billing_status: computeBillingStatus(
+        summary.balance_due,
+        summary.overdue_invoices,
+      ),
+      risk_score: risk.score,
+      risk_band: risk.band,
+      flags,
+      primary_contact: {
+        name: row.whmcs_company_name || displayName,
+        email: row.whmcs_email ?? null,
+      },
       whmcs: {
         whmcs_client_id: row.whmcs_client_id ?? null,
         company_name: row.whmcs_company_name ?? null,

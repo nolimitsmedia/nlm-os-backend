@@ -2,6 +2,16 @@
 import { Router, type Router as ExpressRouter } from "express";
 import { query } from "../db.js";
 import { clickupListTasks, hasClickUp } from "../integrations/clickup.js";
+import { isSharePointConfigured } from "../integrations/sharepoint.js";
+import {
+  buildAiCacheKey,
+  chooseAiRoute,
+  ensureAiSupportTables,
+  fetchRecentAiLogs,
+  getCachedAiPayload,
+  logAiInteraction,
+  setCachedAiPayload,
+} from "../services/aiService.js";
 
 type DbRow = Record<string, any>;
 
@@ -21,6 +31,10 @@ type TaskItem = {
   due_date: string | null;
   updated_at: string | null;
   source_table: string;
+  external_id?: string | null;
+  sop_id?: string | null;
+  sop_title?: string | null;
+  sop_url?: string | null;
 };
 
 type TicketItem = {
@@ -36,6 +50,24 @@ type ChatHistoryItem = {
   role?: string;
   text?: string;
   content?: string;
+};
+
+type CommunicationItem = {
+  id: string;
+  client_id?: string | null;
+  type?: string | null;
+  title?: string | null;
+  body?: string | null;
+  direction?: string | null;
+  channel?: string | null;
+  source?: string | null;
+  source_ref?: string | null;
+  status?: string | null;
+  priority?: string | null;
+  sentiment?: string | null;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 const router: ExpressRouter = Router();
@@ -134,6 +166,249 @@ async function firstExistingTable(candidates: string[]) {
     if (await tableExists(name)) return name;
   }
   return null;
+}
+
+function safeSharePointConfiguredForAi() {
+  try {
+    return !!isSharePointConfigured();
+  } catch {
+    return false;
+  }
+}
+
+async function getSopSummary(clientId: string) {
+  try {
+    const tableReady = await tableExists("sops");
+    if (!tableReady) {
+      return {
+        available: false,
+        configured: false,
+        count: 0,
+        recent_titles: [] as string[],
+        items: [] as any[],
+      };
+    }
+
+    const columns = await columnsFor("sops");
+    const hasSource = columns.has("source");
+    const rows = await query<DbRow>(
+      `
+      SELECT id, title, url, tags, ${hasSource ? "source" : "NULL::text AS source"}, created_at
+      FROM sops
+      WHERE client_id = $1
+      ORDER BY created_at DESC NULLS LAST
+      LIMIT 5
+      `,
+      [clientId],
+    );
+
+    return {
+      available: true,
+      configured: safeSharePointConfiguredForAi(),
+      count: rows.rows.length,
+      recent_titles: rows.rows
+        .map((row) => String(row.title || row.url || "SOP reference"))
+        .filter(Boolean)
+        .slice(0, 5),
+      items: rows.rows,
+    };
+  } catch {
+    return {
+      available: false,
+      configured: safeSharePointConfiguredForAi(),
+      count: 0,
+      recent_titles: [] as string[],
+      items: [] as any[],
+    };
+  }
+}
+
+async function clientHasSops(clientId: string) {
+  try {
+    const tableReady = await tableExists("sops");
+    if (!tableReady) return false;
+    const r = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM sops WHERE client_id = $1`,
+      [clientId],
+    );
+    return toNum(r.rows?.[0]?.count) > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureCommunicationsTable() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS communications_timeline (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      client_id text NOT NULL,
+      type text NOT NULL DEFAULT 'note',
+      title text,
+      body text NOT NULL,
+      direction text,
+      channel text,
+      source text NOT NULL DEFAULT 'manual',
+      source_ref text,
+      status text,
+      priority text,
+      sentiment text,
+      created_by text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `).catch(() => null);
+
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_communications_timeline_client_created
+    ON communications_timeline (client_id, created_at DESC)
+  `).catch(() => null);
+}
+
+function buildCommunicationsAggregate(rows: CommunicationItem[]) {
+  const items = Array.isArray(rows) ? rows : [];
+  const unresolved = items.filter((item) =>
+    [
+      "open",
+      "pending",
+      "follow-up",
+      "follow_up",
+      "needs-response",
+      "needs response",
+    ].includes(safeLower(item?.status)),
+  );
+  const urgent = items.filter((item) =>
+    ["urgent", "high"].includes(safeLower(item?.priority)),
+  );
+  const negative = items.filter((item) =>
+    ["negative", "at-risk", "risk", "frustrated"].includes(
+      safeLower(item?.sentiment),
+    ),
+  );
+
+  const countsByType = items.reduce((acc: Record<string, number>, item) => {
+    const key = safeLower(item?.type || "note") || "note";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  const latest = items
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.created_at || 0).getTime() -
+        new Date(a.created_at || 0).getTime(),
+    )[0];
+
+  const summaryParts: string[] = [];
+  summaryParts.push(
+    items.length
+      ? `${items.length} communication timeline entr${items.length === 1 ? "y" : "ies"} recorded.`
+      : "No communication timeline entries recorded yet.",
+  );
+  if (Object.keys(countsByType).length) {
+    const topTypes = Object.entries(countsByType)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([key, count]) => `${count} ${key}`)
+      .join(", ");
+    summaryParts.push(`Top activity types: ${topTypes}.`);
+  }
+  if (unresolved.length) {
+    summaryParts.push(
+      `${unresolved.length} entr${unresolved.length === 1 ? "y is" : "ies are"} still open or need follow-up.`,
+    );
+  }
+  if (urgent.length) {
+    summaryParts.push(
+      `${urgent.length} entr${urgent.length === 1 ? "y is" : "ies are"} marked urgent or high priority.`,
+    );
+  }
+  if (negative.length) {
+    summaryParts.push(
+      `${negative.length} entr${negative.length === 1 ? "y shows" : "ies show"} negative or at-risk sentiment.`,
+    );
+  }
+  if (latest?.created_at) {
+    summaryParts.push(
+      `Latest communication logged ${new Date(latest.created_at).toLocaleString()}.`,
+    );
+  }
+
+  const nextActions = [
+    unresolved.length
+      ? "Review open follow-ups and assign an owner for each client-facing response."
+      : "",
+    urgent.length
+      ? "Escalate urgent communication items and align them with task owners."
+      : "",
+    negative.length
+      ? "Address negative sentiment quickly and send a clear client update."
+      : "",
+    !items.length
+      ? "Log the first communication entry so Client 360 can summarize client interactions."
+      : "",
+  ].filter(Boolean);
+
+  return {
+    count: items.length,
+    unresolved_count: unresolved.length,
+    urgent_count: urgent.length,
+    negative_count: negative.length,
+    latest_at: latest?.created_at || null,
+    counts_by_type: countsByType,
+    next_actions: nextActions,
+    summary: summaryParts.join(" "),
+    items,
+  };
+}
+
+async function getCommunicationsSummary(clientId: string) {
+  try {
+    await ensureCommunicationsTable();
+    const rows = await query<DbRow>(
+      `
+      SELECT
+        id,
+        client_id,
+        type,
+        title,
+        body,
+        direction,
+        channel,
+        source,
+        source_ref,
+        status,
+        priority,
+        sentiment,
+        created_by,
+        created_at,
+        updated_at
+      FROM communications_timeline
+      WHERE client_id = $1
+      ORDER BY created_at DESC
+      LIMIT 25
+      `,
+      [clientId],
+    ).catch(() => ({ rows: [] }) as any);
+
+    return {
+      available: true,
+      ...buildCommunicationsAggregate(rows.rows as CommunicationItem[]),
+    };
+  } catch {
+    return {
+      available: false,
+      count: 0,
+      unresolved_count: 0,
+      urgent_count: 0,
+      negative_count: 0,
+      latest_at: null,
+      counts_by_type: {} as Record<string, number>,
+      next_actions: [] as string[],
+      summary: "Communications timeline unavailable.",
+      items: [] as CommunicationItem[],
+    };
+  }
 }
 
 async function getClientSnapshot(clientId: string) {
@@ -334,6 +609,7 @@ function normalizeRemoteTask(task: any): TaskItem {
     due_date: toIso(rawDueDate),
     updated_at: toIso(rawUpdatedAt),
     source_table: "clickup_remote",
+    external_id: String(rawId),
   };
 }
 
@@ -346,6 +622,10 @@ async function getTaskSummary(clientId: string) {
   const hasUpdatedAt = taskColumns.has("updated_at");
   const hasCreatedAt = taskColumns.has("created_at");
   const hasSource = taskColumns.has("source");
+  const hasClickupTaskId = taskColumns.has("clickup_task_id");
+  const hasSopId = taskColumns.has("sop_id");
+  const hasSopTitle = taskColumns.has("sop_title");
+  const hasSopUrl = taskColumns.has("sop_url");
 
   const localResult = await query<DbRow>(
     `
@@ -362,7 +642,11 @@ async function getTaskSummary(clientId: string) {
             ? `created_at`
             : `NULL::timestamptz`
       } AS updated_at,
-      ${hasSource ? `source::text` : `'local'::text`} AS source
+      ${hasSource ? `source::text` : `'local'::text`} AS source,
+      ${hasClickupTaskId ? `clickup_task_id::text` : `NULL::text`} AS clickup_task_id,
+      ${hasSopId ? `sop_id::text` : `NULL::text`} AS sop_id,
+      ${hasSopTitle ? `sop_title::text` : `NULL::text`} AS sop_title,
+      ${hasSopUrl ? `sop_url::text` : `NULL::text`} AS sop_url
     FROM tasks
     WHERE client_id = $1
     ORDER BY ${
@@ -381,6 +665,10 @@ async function getTaskSummary(clientId: string) {
     due_date: toIso(row.due_date),
     updated_at: toIso(row.updated_at),
     source_table: row.source ? `tasks:${String(row.source)}` : "tasks:local",
+    external_id: row.clickup_task_id ? String(row.clickup_task_id) : null,
+    sop_id: row.sop_id ? String(row.sop_id) : null,
+    sop_title: row.sop_title ? String(row.sop_title) : null,
+    sop_url: row.sop_url ? String(row.sop_url) : null,
   }));
 
   let remoteItems: TaskItem[] = [];
@@ -398,11 +686,65 @@ async function getTaskSummary(clientId: string) {
     console.warn("[ai] ClickUp task fetch failed");
   }
 
+  function taskDedupeKey(item: TaskItem) {
+    const externalId = String(item.external_id || "").trim();
+    if (externalId) return `external:${externalId}`;
+
+    const title = safeLower(item.title || "");
+    const status = safeLower(item.status || "");
+    const due = String(item.due_date || "").trim();
+    return `fallback:${title}|${status}|${due}`;
+  }
+
+  function mergeTaskRecord(existing: TaskItem, incoming: TaskItem): TaskItem {
+    const sourceSet = new Set(
+      [existing.source_table, incoming.source_table].filter(Boolean),
+    );
+
+    const existingTs = new Date(
+      existing.updated_at || existing.due_date || 0,
+    ).getTime();
+    const incomingTs = new Date(
+      incoming.updated_at || incoming.due_date || 0,
+    ).getTime();
+
+    const primary =
+      incoming.source_table.startsWith("tasks:") &&
+      !existing.source_table.startsWith("tasks:")
+        ? incoming
+        : existing.source_table.startsWith("tasks:") &&
+            !incoming.source_table.startsWith("tasks:")
+          ? existing
+          : incomingTs >= existingTs
+            ? incoming
+            : existing;
+
+    const secondary = primary === existing ? incoming : existing;
+
+    return {
+      ...primary,
+      title: primary.title || secondary.title,
+      status: primary.status || secondary.status,
+      priority: primary.priority || secondary.priority,
+      due_date: primary.due_date || secondary.due_date,
+      updated_at: primary.updated_at || secondary.updated_at,
+      external_id: primary.external_id || secondary.external_id || null,
+      source_table: [...sourceSet].join(" + "),
+      sop_id: primary.sop_id || secondary.sop_id || null,
+      sop_title: primary.sop_title || secondary.sop_title || null,
+      sop_url: primary.sop_url || secondary.sop_url || null,
+    };
+  }
+
   const mergedMap = new Map<string, TaskItem>();
   for (const item of [...remoteItems, ...localItems]) {
-    const key =
-      String(item.id || "") || `${item.title}:${item.updated_at || ""}`;
-    if (!mergedMap.has(key)) mergedMap.set(key, item);
+    const key = taskDedupeKey(item);
+    const existing = mergedMap.get(key);
+    if (!existing) {
+      mergedMap.set(key, item);
+    } else {
+      mergedMap.set(key, mergeTaskRecord(existing, item));
+    }
   }
 
   const items = [...mergedMap.values()]
@@ -449,6 +791,17 @@ async function getTaskSummary(clientId: string) {
     return dd !== null && dd < 0 && !isClosed(x.statusLower);
   }).length;
 
+  const clientRequiresSop = await clientHasSops(clientId);
+  const linkedSopCount = localItems.filter(
+    (item: any) =>
+      String(item?.sop_id || "").trim() ||
+      String(item?.sop_title || "").trim() ||
+      String(item?.sop_url || "").trim(),
+  ).length;
+  const sopGapCount = clientRequiresSop
+    ? Math.max(localItems.length - linkedSopCount, 0)
+    : 0;
+
   return {
     available: localItems.length > 0 || remoteAvailable,
     tableName: remoteAvailable ? "tasks + clickup" : "tasks",
@@ -457,6 +810,10 @@ async function getTaskSummary(clientId: string) {
     overdue,
     in_progress: inProgress,
     blocked,
+    sop_required: clientRequiresSop,
+    sop_linked: linkedSopCount,
+    sop_gap_count: sopGapCount,
+    fallback_mode: !safeSharePointConfiguredForAi(),
     items,
   };
 }
@@ -596,6 +953,11 @@ function calculateRisk(
   billing: DbRow,
   tasks: Awaited<ReturnType<typeof getTaskSummary>>,
   tickets: Awaited<ReturnType<typeof getTicketSummary>>,
+  communications?: {
+    unresolved_count?: number;
+    urgent_count?: number;
+    negative_count?: number;
+  },
 ) {
   let score = 8;
   const reasons: string[] = [];
@@ -664,6 +1026,26 @@ function calculateRisk(
       `${servicesDueSoon} renewal${servicesDueSoon === 1 ? "" : "s"} due within 30 days`,
     );
   }
+  if (communications) {
+    if (toNum(communications.unresolved_count) > 0) {
+      score += toNum(communications.unresolved_count) * 4;
+      reasons.push(
+        `${toNum(communications.unresolved_count)} communication follow-up${toNum(communications.unresolved_count) === 1 ? "" : "s"} still open`,
+      );
+    }
+    if (toNum(communications.urgent_count) > 0) {
+      score += toNum(communications.urgent_count) * 5;
+      reasons.push(
+        `${toNum(communications.urgent_count)} urgent communication item${toNum(communications.urgent_count) === 1 ? "" : "s"}`,
+      );
+    }
+    if (toNum(communications.negative_count) > 0) {
+      score += toNum(communications.negative_count) * 8;
+      reasons.push(
+        `${toNum(communications.negative_count)} negative or at-risk communication signal${toNum(communications.negative_count) === 1 ? "" : "s"}`,
+      );
+    }
+  }
 
   score = Math.max(0, Math.min(100, score));
 
@@ -674,7 +1056,7 @@ function calculateRisk(
   return {
     score,
     band,
-    reasons: reasons.slice(0, 6),
+    reasons: reasons.slice(0, 8),
   };
 }
 
@@ -683,6 +1065,11 @@ function buildOpportunities(args: {
   billing: DbRow;
   tasks: Awaited<ReturnType<typeof getTaskSummary>>;
   tickets: Awaited<ReturnType<typeof getTicketSummary>>;
+  communications?: {
+    count?: number;
+    unresolved_count?: number;
+    negative_count?: number;
+  };
   risk: ReturnType<typeof calculateRisk>;
 }) {
   const items: string[] = [];
@@ -730,6 +1117,15 @@ function buildOpportunities(args: {
       "An upcoming renewal creates a natural opportunity to revisit scope, pricing, and bundled services before renewal is finalized.",
     );
   }
+  if (
+    toNum(args.communications?.count) > 0 &&
+    toNum(args.communications?.negative_count) === 0 &&
+    balanceDue === 0
+  ) {
+    items.push(
+      "Recent communication history appears active and stable, which creates a good opening for a proactive strategy review or expansion discussion.",
+    );
+  }
 
   return items.slice(0, 5);
 }
@@ -738,6 +1134,19 @@ function buildNextBestActions(context: {
   billing: DbRow;
   tasks: Awaited<ReturnType<typeof getTaskSummary>>;
   tickets: Awaited<ReturnType<typeof getTicketSummary>>;
+  communications?: {
+    count?: number;
+    unresolved_count?: number;
+    urgent_count?: number;
+    negative_count?: number;
+    next_actions?: string[];
+  };
+  sops?: {
+    available?: boolean;
+    configured?: boolean;
+    count?: number;
+    recent_titles?: string[];
+  };
   risk: ReturnType<typeof calculateRisk>;
 }) {
   const actions: string[] = [];
@@ -780,6 +1189,21 @@ function buildNextBestActions(context: {
       "Re-engage stale support threads to reduce perceived silence and churn risk.",
     );
   }
+  if (toNum(context.communications?.unresolved_count) > 0) {
+    actions.push(
+      "Review open communication follow-ups and assign a clear owner and due date for each response.",
+    );
+  }
+  if (toNum(context.communications?.urgent_count) > 0) {
+    actions.push(
+      "Handle urgent communication items first and send the client a same-day update.",
+    );
+  }
+  if (toNum(context.communications?.negative_count) > 0) {
+    actions.push(
+      "Address recent negative client sentiment quickly and document a recovery plan in the communications timeline.",
+    );
+  }
   if (activeServices <= 1) {
     actions.push(
       "Review the current service footprint and identify at least one adjacent recurring service to propose.",
@@ -790,14 +1214,35 @@ function buildNextBestActions(context: {
       "Prepare an upsell or bundled-service recommendation to increase monthly recurring revenue.",
     );
   }
-
-  if (actions.length === 0) {
+  if (toNum((context.tasks as any)?.sop_gap_count) > 0) {
     actions.push(
-      "Maintain regular client check-ins and confirm there are no hidden billing, delivery, or support issues.",
+      `Link SOPs to ${toNum((context.tasks as any)?.sop_gap_count)} open task${toNum((context.tasks as any)?.sop_gap_count) === 1 ? "" : "s"} to reduce execution drift.`,
+    );
+  }
+  if (context.sops?.configured && !toNum(context.sops?.count)) {
+    actions.push(
+      "SharePoint is configured but no SOP links were found for this client. Add at least one SOP reference to improve execution consistency.",
+    );
+  }
+  if (!context.sops?.configured) {
+    actions.push(
+      "SharePoint is still pending, so rely on manual SOP links until the live document workspace is ready.",
     );
   }
 
-  return actions.slice(0, 6);
+  if (Array.isArray(context.communications?.next_actions)) {
+    for (const item of context.communications.next_actions) {
+      if (item && !actions.includes(item)) actions.push(item);
+    }
+  }
+
+  if (actions.length === 0) {
+    actions.push(
+      "Maintain regular client check-ins and confirm there are no hidden billing, delivery, support, or communication issues.",
+    );
+  }
+
+  return actions.slice(0, 8);
 }
 
 function buildQuestionHints(question: string) {
@@ -820,6 +1265,10 @@ function buildQuestionHints(question: string) {
       ),
     asksExecutiveSummary:
       /(summary|overview|snapshot|what's going on|status)/.test(q),
+    asksCommunications:
+      /(communication|timeline|follow-up|follow up|email|call|meeting|conversation|sentiment|message)/.test(
+        q,
+      ),
   };
 }
 
@@ -830,6 +1279,7 @@ function buildFallbackReply(args: {
   billing: DbRow;
   tasks: Awaited<ReturnType<typeof getTaskSummary>>;
   tickets: Awaited<ReturnType<typeof getTicketSummary>>;
+  communications: Awaited<ReturnType<typeof getCommunicationsSummary>>;
   risk: ReturnType<typeof calculateRisk>;
   question: string;
   nextActions: string[];
@@ -847,6 +1297,10 @@ function buildFallbackReply(args: {
   const ticketLine = args.tickets.available
     ? `Tickets: ${args.tickets.open} open, ${args.tickets.urgent} urgent, ${args.tickets.stale} stale.`
     : `Tickets: no connected ticket dataset found.`;
+
+  const commLine = args.communications.available
+    ? `Communications: ${args.communications.count} entries, ${args.communications.unresolved_count} open follow-up, ${args.communications.urgent_count} urgent, ${args.communications.negative_count} negative/at-risk signals.`
+    : `Communications: timeline unavailable.`;
 
   const renewalPrediction =
     toNum(args.billing.renewal_value_30d) > 0
@@ -878,6 +1332,12 @@ function buildFallbackReply(args: {
   if (hints.asksTickets) {
     directAnswerParts.push(ticketLine);
   }
+  if (hints.asksCommunications) {
+    directAnswerParts.push(
+      args.communications.summary ||
+        "No communication timeline summary is available yet.",
+    );
+  }
   if (hints.asksOpportunity) {
     directAnswerParts.push(
       args.opportunities[0] ||
@@ -886,7 +1346,7 @@ function buildFallbackReply(args: {
   }
   if (!directAnswerParts.length) {
     directAnswerParts.push(
-      "Based on the current client snapshot, the highest-value focus right now is billing health, renewal readiness, service expansion opportunities, and proactive follow-up on any blocked work or urgent support items.",
+      "Based on the current client snapshot, the highest-value focus right now is billing health, renewal readiness, communication follow-up discipline, service expansion opportunities, and proactive follow-up on any blocked work or urgent support items.",
     );
   }
 
@@ -909,6 +1369,7 @@ function buildFallbackReply(args: {
     `### Work and support`,
     taskLine,
     ticketLine,
+    commLine,
     ``,
     `### Opportunities`,
     ...(args.opportunities.length
@@ -936,12 +1397,12 @@ async function askAnthropic(input: {
   const model = env("ANTHROPIC_MODEL", "claude-sonnet-4-0");
   const system = [
     "You are the AI Client Success Copilot for No Limits Media OS.",
-    "Your role is to help account managers, operations staff, and leadership understand a client's health, billing posture, renewal readiness, operational risks, and growth opportunities.",
-    "You can answer questions about billing, invoices, revenue, MRR, renewals, task blockers, support issues, churn risk, client health, executive summaries, recommendations, and upsell opportunities.",
+    "Your role is to help account managers, operations staff, and leadership understand a client's health, billing posture, renewal readiness, operational risks, communication history, follow-up discipline, and growth opportunities.",
+    "You can answer questions about billing, invoices, revenue, MRR, renewals, task blockers, support issues, communications timeline, meetings, calls, emails, follow-ups, churn risk, client health, executive summaries, recommendations, and upsell opportunities.",
     "Use only the provided JSON context and recent conversation history.",
     "If some data is unavailable, say so plainly and do not invent it.",
     "Always provide practical, business-focused answers with clear reasoning.",
-    "When relevant, structure the answer with concise markdown sections such as Direct Answer, Client Health, Billing Intelligence, Renewal Forecast, Risks, Opportunities, and Recommended Actions.",
+    "When relevant, structure the answer with concise markdown sections such as Direct Answer, Client Health, Billing Intelligence, Communications Timeline, Renewal Forecast, Risks, Opportunities, and Recommended Actions.",
     "Prefer concise but useful answers, and directly answer the user's latest question before expanding.",
   ].join(" ");
 
@@ -1034,25 +1495,36 @@ async function buildClientIntelligence(args: {
     : null;
   const currency = snapshot.whmcs_currency || "USD";
 
-  const [billing, tasks, tickets] = await Promise.all([
+  const [billing, tasks, tickets, sops, communications] = await Promise.all([
     getBillingSummary(whmcsClientId),
     getTaskSummary(args.clientId),
     getTicketSummary(args.clientId, whmcsClientId),
+    getSopSummary(args.clientId),
+    getCommunicationsSummary(args.clientId),
   ]);
 
-  const risk = calculateRisk(clientStatus, billing, tasks, tickets);
+  const risk = calculateRisk(
+    clientStatus,
+    billing,
+    tasks,
+    tickets,
+    communications,
+  );
   const healthScore = clamp(100 - risk.score, 0, 100);
   const opportunities = buildOpportunities({
     clientStatus,
     billing,
     tasks,
     tickets,
+    communications,
     risk,
   });
   const nextActions = buildNextBestActions({
     billing,
     tasks,
     tickets,
+    communications,
+    sops,
     risk,
   });
 
@@ -1087,6 +1559,16 @@ async function buildClientIntelligence(args: {
       `${toNum(billing.services_due_30d)} renewal${toNum(billing.services_due_30d) === 1 ? "" : "s"} due within 30 days.`,
     );
   }
+  if (toNum(communications.unresolved_count) > 0) {
+    alerts.push(
+      `${toNum(communications.unresolved_count)} communication follow-up${toNum(communications.unresolved_count) === 1 ? "" : "s"} remain open.`,
+    );
+  }
+  if (toNum(communications.negative_count) > 0) {
+    alerts.push(
+      `${toNum(communications.negative_count)} negative or at-risk communication signal${toNum(communications.negative_count) === 1 ? "" : "s"} detected.`,
+    );
+  }
   if (!alerts.length) {
     alerts.push("No critical client alerts detected right now.");
   }
@@ -1095,7 +1577,8 @@ async function buildClientIntelligence(args: {
     `${clientLabel} is currently in the ${risk.band} risk band with a score of ${risk.score}/100. ` +
     `MRR is ${money(billing.mrr, currency)}, open balance is ${money(billing.balance_due, currency)}, ` +
     `${toNum(billing.active_services)} active service${toNum(billing.active_services) === 1 ? "" : "s"} are connected, ` +
-    `and ${toNum(billing.open_invoices)} invoice${toNum(billing.open_invoices) === 1 ? "" : "s"} remain open.`;
+    `${toNum(billing.open_invoices)} invoice${toNum(billing.open_invoices) === 1 ? "" : "s"} remain open, and ` +
+    `${toNum(communications.unresolved_count)} communication follow-up${toNum(communications.unresolved_count) === 1 ? "" : "s"} are still open.`;
 
   return {
     snapshot,
@@ -1106,6 +1589,8 @@ async function buildClientIntelligence(args: {
     billing,
     tasks,
     tickets,
+    sops,
+    communications,
     risk,
     healthScore,
     opportunities,
@@ -1201,6 +1686,36 @@ async function getGlobalTicketSignals() {
     };
   } catch {
     return { total: 0, open: 0, urgent: 0, stale: 0 };
+  }
+}
+
+async function getGlobalCommunicationsSignals() {
+  try {
+    await ensureCommunicationsTable();
+    const r = await query<DbRow>(
+      `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(status, '')) IN ('open','pending','follow-up','follow_up','needs-response','needs response')
+        )::int AS unresolved,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(priority, '')) IN ('urgent','high')
+        )::int AS urgent,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(sentiment, '')) IN ('negative','at-risk','risk','frustrated')
+        )::int AS negative
+      FROM communications_timeline
+      `,
+    );
+    return {
+      total: toNum(r.rows[0]?.total),
+      unresolved: toNum(r.rows[0]?.unresolved),
+      urgent: toNum(r.rows[0]?.urgent),
+      negative: toNum(r.rows[0]?.negative),
+    };
+  } catch {
+    return { total: 0, unresolved: 0, urgent: 0, negative: 0 };
   }
 }
 
@@ -1418,12 +1933,8 @@ async function buildGlobalInsights() {
   const renewalsNext = rows
     .filter((row) => toNum(row.renewals_due_30d) > 0)
     .sort((a, b) => {
-      const ad = a.next_renewal_date
-        ? new Date(a.next_renewal_date).getTime()
-        : Number.MAX_SAFE_INTEGER;
-      const bd = b.next_renewal_date
-        ? new Date(b.next_renewal_date).getTime()
-        : Number.MAX_SAFE_INTEGER;
+      const ad = row_date(a.next_renewal_date);
+      const bd = row_date(b.next_renewal_date);
       return ad - bd;
     })
     .slice(0, 6)
@@ -1450,6 +1961,7 @@ async function buildGlobalInsights() {
 
   const taskSignals = await getGlobalTaskSignals();
   const ticketSignals = await getGlobalTicketSignals();
+  const communicationsSignals = await getGlobalCommunicationsSignals();
 
   const alerts: string[] = [];
   if (rows.some((row) => row.risk_score >= 65)) {
@@ -1465,6 +1977,11 @@ async function buildGlobalInsights() {
   if (ticketSignals.urgent > 0) {
     alerts.push(
       `${ticketSignals.urgent} urgent ticket${ticketSignals.urgent === 1 ? "" : "s"} are still open.`,
+    );
+  }
+  if (communicationsSignals.negative > 0) {
+    alerts.push(
+      `${communicationsSignals.negative} negative communication signal${communicationsSignals.negative === 1 ? "" : "s"} detected across client timelines.`,
     );
   }
   if (!alerts.length) {
@@ -1543,9 +2060,16 @@ async function buildGlobalInsights() {
       open_tickets: ticketSignals.open,
       urgent_tickets: ticketSignals.urgent,
       stale_tickets: ticketSignals.stale,
+      communication_entries: communicationsSignals.total,
+      communication_open_followups: communicationsSignals.unresolved,
+      communication_negative_count: communicationsSignals.negative,
     },
     alerts,
   };
+}
+
+function row_date(value: any) {
+  return value ? new Date(value).getTime() : Number.MAX_SAFE_INTEGER;
 }
 
 router.post("/client-summary", async (req, res) => {
@@ -1574,21 +2098,37 @@ router.post("/client-summary", async (req, res) => {
       : null;
     const currency = String(snapshot.whmcs_currency || "USD").trim() || "USD";
 
-    const [billing, tasks, tickets] = await Promise.all([
+    const [billing, tasks, tickets, sops, communications] = await Promise.all([
       getBillingSummary(whmcsClientId),
       getTaskSummary(clientId),
       getTicketSummary(clientId, whmcsClientId),
+      getSopSummary(clientId),
+      getCommunicationsSummary(clientId),
     ]);
 
-    const risk = calculateRisk(clientStatus, billing, tasks, tickets);
+    const risk = calculateRisk(
+      clientStatus,
+      billing,
+      tasks,
+      tickets,
+      communications,
+    );
     const opportunities = buildOpportunities({
       clientStatus,
       billing,
       tasks,
       tickets,
+      communications,
       risk,
     });
-    const nextActions = buildNextBestActions({ billing, tasks, tickets, risk });
+    const nextActions = buildNextBestActions({
+      billing,
+      tasks,
+      tickets,
+      communications,
+      sops,
+      risk,
+    });
 
     const context = {
       generated_at: new Date().toISOString(),
@@ -1630,6 +2170,9 @@ router.post("/client-summary", async (req, res) => {
         overdue: tasks.overdue,
         in_progress: tasks.in_progress,
         blocked: tasks.blocked,
+        sop_required: (tasks as any).sop_required,
+        sop_linked: (tasks as any).sop_linked,
+        sop_gap_count: (tasks as any).sop_gap_count,
         items: tasks.items,
       },
       tickets: {
@@ -1641,19 +2184,146 @@ router.post("/client-summary", async (req, res) => {
         stale: tickets.stale,
         items: tickets.items,
       },
+      communications: {
+        available: communications.available,
+        count: communications.count,
+        unresolved_count: communications.unresolved_count,
+        urgent_count: communications.urgent_count,
+        negative_count: communications.negative_count,
+        latest_at: communications.latest_at,
+        counts_by_type: communications.counts_by_type,
+        summary: communications.summary,
+        next_actions: communications.next_actions,
+        items: communications.items.slice(0, 10).map((item: any) => ({
+          id: item?.id ?? null,
+          type: item?.type ?? null,
+          title: item?.title ?? null,
+          body: item?.body ?? null,
+          channel: item?.channel ?? null,
+          status: item?.status ?? null,
+          priority: item?.priority ?? null,
+          sentiment: item?.sentiment ?? null,
+          created_at: item?.created_at ?? null,
+        })),
+      },
+      sops: {
+        available: sops.available,
+        configured: sops.configured,
+        fallback_mode: !sops.configured,
+        count: sops.count,
+        recent_titles: sops.recent_titles,
+        items: Array.isArray(sops.items)
+          ? sops.items.map((item: any) => ({
+              id: item?.id ?? null,
+              title: item?.title ?? null,
+              url: item?.url ?? null,
+              source: item?.source ?? null,
+              tags: item?.tags ?? null,
+            }))
+          : [],
+      },
       risk,
       opportunities,
       next_best_actions: nextActions,
       conversation_history: history,
     };
 
+    await ensureAiSupportTables();
+
+    const provider = env("AI_PROVIDER", "anthropic").toLowerCase();
+    const routePlan = chooseAiRoute({
+      provider,
+      question: question || "Provide a complete Client 360 summary.",
+      history,
+      context,
+      anthropicModel: env("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+    });
+
+    const cacheKey = buildAiCacheKey({
+      clientId,
+      question: question || "Provide a complete Client 360 summary.",
+      history,
+      provider: routePlan.provider,
+      routeHint: routePlan.route,
+      context: {
+        risk,
+        billing: {
+          balance_due: context.billing.balance_due,
+          overdue_invoices: context.billing.overdue_invoices,
+          mrr: context.billing.mrr,
+        },
+        tasks: {
+          open: context.tasks.open,
+          blocked: context.tasks.blocked,
+          overdue: context.tasks.overdue,
+          sop_gap_count: context.tasks.sop_gap_count,
+        },
+        tickets: {
+          open: context.tickets.open,
+          urgent: context.tickets.urgent,
+          stale: context.tickets.stale,
+        },
+        communications: {
+          count: context.communications.count,
+          unresolved_count: context.communications.unresolved_count,
+          urgent_count: context.communications.urgent_count,
+          negative_count: context.communications.negative_count,
+        },
+        sops: {
+          count: context.sops.count,
+          configured: context.sops.configured,
+          recent_titles: context.sops.recent_titles,
+        },
+      },
+    });
+
+    const cachedPayload = await getCachedAiPayload<any>(cacheKey, 36);
+    if (cachedPayload?.reply) {
+      await logAiInteraction({
+        clientId,
+        userId: String((req as any)?.user?.id || ""),
+        prompt: question || "Provide a complete Client 360 summary.",
+        response: String(cachedPayload.reply || ""),
+        provider: routePlan.provider,
+        model: (cachedPayload as any)?.meta?.model || routePlan.model,
+        cacheKey,
+        cached: true,
+        routeReason: routePlan.reason,
+        requestId: (cachedPayload as any)?.meta?.anthropic_request_id || null,
+        meta: {
+          route: routePlan.route,
+          cache_hit: true,
+        },
+      });
+
+      return res.json({
+        ...(cachedPayload as any),
+        ok: true,
+        clientId,
+        meta: {
+          ...(((cachedPayload as any)?.meta || {}) as Record<string, any>),
+          cached: true,
+          cache_key: cacheKey,
+          route: routePlan.route,
+          route_reason: routePlan.reason,
+          provider: routePlan.provider,
+        },
+      });
+    }
+
     let reply = "";
-    let aiMeta: { model?: string | null; requestId?: string | null } = {};
+    let aiMeta: {
+      model?: string | null;
+      requestId?: string | null;
+      provider?: string | null;
+      route?: string | null;
+    } = {
+      provider: routePlan.provider,
+      route: routePlan.route,
+    };
 
     try {
-      const provider = env("AI_PROVIDER", "anthropic").toLowerCase();
-
-      if (provider === "anthropic") {
+      if (routePlan.provider === "anthropic") {
         const ai = await askAnthropic({
           clientLabel,
           question: question || "Provide a complete Client 360 summary.",
@@ -1663,7 +2333,12 @@ router.post("/client-summary", async (req, res) => {
 
         if (ai?.text) {
           reply = ai.text;
-          aiMeta = { model: ai.model, requestId: ai.requestId };
+          aiMeta = {
+            model: ai.model,
+            requestId: ai.requestId,
+            provider: "anthropic",
+            route: routePlan.route,
+          };
         }
       }
     } catch (err: any) {
@@ -1681,16 +2356,21 @@ router.post("/client-summary", async (req, res) => {
         billing,
         tasks,
         tickets,
+        communications,
         risk,
         question,
         nextActions,
         opportunities,
       });
+      aiMeta = {
+        ...aiMeta,
+        provider: "fallback",
+        route: "fallback-rule-engine",
+      };
     }
 
     const usingAnthropic =
-      env("AI_PROVIDER", "anthropic").toLowerCase() === "anthropic" &&
-      !!env("ANTHROPIC_API_KEY");
+      routePlan.provider === "anthropic" && !!env("ANTHROPIC_API_KEY");
 
     const healthScore = clamp(100 - risk.score, 0, 100);
 
@@ -1735,6 +2415,26 @@ router.post("/client-summary", async (req, res) => {
         available: tickets.available,
       },
       {
+        type: "db",
+        label: communications.available
+          ? `Communications timeline (${communications.count})`
+          : "Communications timeline unavailable",
+        confidence: communications.available ? 0.86 : 0.25,
+        count: communications.count,
+        available: communications.available,
+      },
+      {
+        type: "db",
+        label: sops.available
+          ? `SOP references${sops.configured ? " + SharePoint ready" : ""}`
+          : sops.configured
+            ? "SharePoint configured, no SOP links yet"
+            : "SOP / SharePoint references unavailable",
+        confidence: sops.available ? 0.84 : 0.35,
+        count: sops.count,
+        available: sops.available || sops.configured,
+      },
+      {
         type: usingAnthropic ? "anthropic" : "fallback",
         label: usingAnthropic
           ? "Anthropic Claude Messages API"
@@ -1744,28 +2444,41 @@ router.post("/client-summary", async (req, res) => {
       },
     ];
 
-    return res.json({
+    const payload = {
       ok: true,
       clientId,
       reply,
       sources,
+      next_best_actions: nextActions,
       meta: {
         feature_set: [
           "billing_intelligence",
           "renewal_prediction",
           "risk_scoring",
           "ticket_summarization",
+          "communications_timeline_awareness",
+          "followup_signal_detection",
+          "sop_reference_awareness",
+          "sharepoint_signal_awareness",
           "next_best_action_engine",
           "opportunity_detection",
           "conversation_memory",
           "executive_copilot_answers",
+          "aggressive_caching",
+          "ai_audit_logging",
+          "anthropic_route_planning",
         ],
         health_score: healthScore,
         risk_score: risk.score,
         risk_band: risk.band,
         opportunity_count: opportunities.length,
-        model: aiMeta.model || null,
+        model: aiMeta.model || routePlan.model || null,
         anthropic_request_id: aiMeta.requestId || null,
+        cached: false,
+        cache_key: cacheKey,
+        route: aiMeta.route || routePlan.route,
+        route_reason: routePlan.reason,
+        provider: aiMeta.provider || routePlan.provider,
       },
       context_preview: {
         client_name: clientLabel,
@@ -1777,9 +2490,38 @@ router.post("/client-summary", async (req, res) => {
         active_services: toNum(billing.active_services),
         open_tasks: tasks.open,
         urgent_tickets: tickets.urgent,
+        communication_entries: communications.count,
+        communication_open_followups: communications.unresolved_count,
+        communication_negative_count: communications.negative_count,
+        sop_count: sops.count,
+        sop_gap_count: (tasks as any).sop_gap_count || 0,
+        sharepoint_fallback: !sops.configured,
         next_renewal_date: toIso(billing.next_renewal_date),
       },
+    };
+
+    await setCachedAiPayload(cacheKey, payload);
+    await logAiInteraction({
+      clientId,
+      userId: String((req as any)?.user?.id || ""),
+      prompt: question || "Provide a complete Client 360 summary.",
+      response: reply,
+      provider: aiMeta.provider || routePlan.provider,
+      model: aiMeta.model || routePlan.model,
+      cacheKey,
+      cached: false,
+      routeReason: routePlan.reason,
+      requestId: aiMeta.requestId || null,
+      meta: {
+        route: aiMeta.route || routePlan.route,
+        risk_score: risk.score,
+        opportunity_count: opportunities.length,
+        source_count: sources.length,
+        communication_entries: communications.count,
+      },
     });
+
+    return res.json(payload);
   } catch (e: any) {
     console.error("[ai] client-summary error", e);
     return res
@@ -1825,7 +2567,14 @@ router.get("/client-insights/:clientId", async (req, res) => {
         renewals_due_30d: toNum(intelligence.billing.services_due_30d),
         renewal_value_30d: toNum(intelligence.billing.renewal_value_30d),
         blocked_tasks: intelligence.tasks.blocked,
+        sop_gap_count: (intelligence.tasks as any).sop_gap_count || 0,
         urgent_tickets: intelligence.tickets.urgent,
+        communication_entries: intelligence.communications.count,
+        communication_open_followups:
+          intelligence.communications.unresolved_count,
+        communication_urgent_count: intelligence.communications.urgent_count,
+        communication_negative_count:
+          intelligence.communications.negative_count,
       },
       alerts: intelligence.alerts,
       opportunities: intelligence.opportunities,
@@ -1834,6 +2583,14 @@ router.get("/client-insights/:clientId", async (req, res) => {
         "Client profile + WHMCS client cache",
         "WHMCS invoices cache",
         "WHMCS services cache",
+        intelligence.communications.available
+          ? `Communications timeline (${intelligence.communications.count})`
+          : "Communications timeline unavailable",
+        intelligence.sops.available
+          ? `SOP references (${intelligence.sops.count})`
+          : intelligence.sops.configured
+            ? "SharePoint configured, no SOP links yet"
+            : "SOP references unavailable (manual fallback active)",
         intelligence.tasks.available
           ? `Tasks from ${intelligence.tasks.tableName}`
           : "Tasks unavailable",
@@ -1860,6 +2617,26 @@ router.get("/global-insights", async (_req, res) => {
     return res.status(500).json({
       ok: false,
       error: e?.message || "Failed to build global insights",
+    });
+  }
+});
+
+router.get("/logs", async (req, res) => {
+  const limit = Math.max(
+    1,
+    Math.min(100, Number(req.query?.limit || 50) || 50),
+  );
+
+  try {
+    await ensureAiSupportTables();
+    const logs = await fetchRecentAiLogs(limit);
+    return res.json({ ok: true, logs });
+  } catch (e: any) {
+    console.error("[ai] logs error", e);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to load AI logs",
+      logs: [],
     });
   }
 });

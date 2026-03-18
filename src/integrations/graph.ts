@@ -7,6 +7,10 @@ type GraphTokenCache = {
 
 let tokenCache: GraphTokenCache = null;
 
+export function clearGraphTokenCache() {
+  tokenCache = null;
+}
+
 function env(name: string, fallback = "") {
   return String(process.env[name] ?? fallback).trim();
 }
@@ -66,6 +70,7 @@ export async function getGraphAccessToken() {
   const data: any = await res.json().catch(() => ({}));
 
   if (!res.ok) {
+    clearGraphTokenCache();
     throw new Error(
       data?.error_description ||
         data?.error?.message ||
@@ -127,6 +132,7 @@ export async function graphFetch(path: string, init: RequestInit = {}) {
       (typeof payload === "string" ? payload : "") ||
       `Graph request failed (${res.status})`;
 
+    if (res.status === 401 || res.status === 403) clearGraphTokenCache();
     throw new Error(message);
   }
 

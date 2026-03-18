@@ -274,16 +274,16 @@ function normalizeTask(t: any) {
   const dueDateMs = toClickUpDueDate(t?.due_date);
 
   return {
-    id: t.id,
-    name: t.name,
-    title: t.name,
-    description: t.description || "",
-    status: t?.status?.status || t?.status || "",
-    url: t.url,
+    id: normalizeString(t?.id),
+    name: normalizeString(t?.name),
+    title: normalizeString(t?.name),
+    description: normalizeString(t?.description),
+    status: normalizeString(t?.status?.status || t?.status || ""),
+    url: normalizeString(t?.url),
     due_date: dueDateMs ? new Date(Number(dueDateMs)).toISOString() : null,
-    date_created: t.date_created,
-    date_updated: t.date_updated,
-    updated_at: t.date_updated || null,
+    date_created: t?.date_created || null,
+    date_updated: t?.date_updated || null,
+    updated_at: t?.date_updated || null,
     source: "clickup",
     tags,
     assignee: extractAssignee(t),
@@ -291,8 +291,57 @@ function normalizeTask(t: any) {
     assignee_ids: extractAssigneeIds(t),
     client_id: clientTagValue || clientFieldValue || "",
     client_name: clientFieldValue || clientTagValue || "",
-    clickup_task_id: t.id,
+    clickup_task_id: normalizeString(t?.id),
   };
+}
+
+function buildNormalizedTaskIdentity(task: any) {
+  const clickupId = normalizeString(task?.clickup_task_id || task?.id);
+  if (clickupId) return `clickup:${clickupId}`;
+
+  const clientKey = normalizeLower(task?.client_id || task?.client_name);
+  const titleKey = normalizeLower(task?.title || task?.name);
+  const descKey = normalizeLower(task?.description);
+
+  if (clientKey || titleKey || descKey) {
+    return `composite:${clientKey}::${titleKey}::${descKey}`;
+  }
+
+  return "";
+}
+
+function taskSortScore(task: any) {
+  let score = 0;
+  if (normalizeString(task?.clickup_task_id || task?.id)) score += 100;
+  if (normalizeString(task?.client_id)) score += 20;
+  if (normalizeString(task?.client_name)) score += 10;
+  if (normalizeString(task?.description)) score += 5;
+  if (Array.isArray(task?.assignee_ids) && task.assignee_ids.length) score += 3;
+  if (normalizeString(task?.due_date)) score += 2;
+  if (normalizeString(task?.updated_at || task?.date_updated)) score += 1;
+  return score;
+}
+
+function dedupeNormalizedTasks(tasks: any[]) {
+  const byKey = new Map<string, any>();
+
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const normalized = normalizeTask(task);
+    const key = buildNormalizedTaskIdentity(normalized);
+
+    if (!key) {
+      const fallback = `${normalizeLower(normalized?.title)}::${normalizeLower(normalized?.client_id || normalized?.client_name)}`;
+      if (!byKey.has(fallback)) byKey.set(fallback, normalized);
+      continue;
+    }
+
+    const existing = byKey.get(key);
+    if (!existing || taskSortScore(normalized) >= taskSortScore(existing)) {
+      byKey.set(key, normalized);
+    }
+  }
+
+  return Array.from(byKey.values());
 }
 
 async function getListCustomFields(listId?: string) {
@@ -510,7 +559,7 @@ export async function listClickUpTasks(args?: ListArgs) {
   );
 
   const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
-  const normalized = tasks.map(normalizeTask);
+  const normalized = dedupeNormalizedTasks(tasks);
 
   const desiredTag = String(
     opts?.tag || (opts?.clientId ? `client:${opts.clientId}` : ""),

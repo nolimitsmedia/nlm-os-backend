@@ -1,3 +1,4 @@
+// services/api/src/routes/tasks.tx
 import { Router } from "express";
 import multer from "multer";
 import { query } from "../db.js";
@@ -17,6 +18,7 @@ import {
   updateClickUpTask,
   updateClickUpTaskStatus,
 } from "../integrations/clickup.js";
+import { isSharePointConfigured } from "../integrations/sharepoint.js";
 
 const router = Router();
 const upload = multer({
@@ -35,6 +37,10 @@ type TasksSchemaInfo = {
   hasAssignee: boolean;
   hasAssigneeIds: boolean;
   hasDueDate: boolean;
+  hasSopId: boolean;
+  hasSopTitle: boolean;
+  hasSopUrl: boolean;
+  hasBillingDependency: boolean;
 };
 
 type AttachmentMirrorResult = {
@@ -67,6 +73,10 @@ async function getTasksSchemaInfo(): Promise<TasksSchemaInfo> {
     hasAssignee: cols.has("assignee"),
     hasAssigneeIds: cols.has("assignee_ids"),
     hasDueDate: cols.has("due_date"),
+    hasSopId: cols.has("sop_id"),
+    hasSopTitle: cols.has("sop_title"),
+    hasSopUrl: cols.has("sop_url"),
+    hasBillingDependency: cols.has("billing_dependency"),
   };
 }
 
@@ -88,6 +98,10 @@ async function ensureTasksTable() {
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee text`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_ids jsonb DEFAULT '[]'::jsonb`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_date timestamptz`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sop_id text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sop_title text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sop_url text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS billing_dependency text`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()`,
   ];
@@ -221,31 +235,101 @@ async function resolveClientName(clientId: string) {
   return titleFromSlug;
 }
 
+function normalizeTaskIdentityPart(value: any) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function buildTaskIdentityKey(task: any) {
+  const clickupId = String(task?.clickup_task_id || task?.id || "").trim();
+  if (clickupId) return `clickup:${clickupId}`;
+
+  const clientKey = normalizeTaskIdentityPart(
+    task?.client_id || task?.client_name || "",
+  );
+  const titleKey = normalizeTaskIdentityPart(task?.title || task?.name || "");
+  const descKey = normalizeTaskIdentityPart(task?.description || "");
+
+  if (clientKey || titleKey || descKey) {
+    return `composite:${clientKey}::${titleKey}::${descKey}`;
+  }
+
+  return "";
+}
+
+function taskPreferenceScore(task: any) {
+  let score = 0;
+
+  if (String(task?.clickup_task_id || task?.id || "").trim()) score += 100;
+  if (
+    String(task?.source || "")
+      .trim()
+      .toLowerCase() === "clickup"
+  )
+    score += 25;
+  if (String(task?.client_id || "").trim()) score += 20;
+  if (String(task?.client_name || "").trim()) score += 10;
+  if (String(task?.description || "").trim()) score += 5;
+  if (Array.isArray(task?.assignee_ids) && task.assignee_ids.length) score += 3;
+  if (String(task?.due_date || "").trim()) score += 2;
+  if (String(task?.updated_at || task?.date_updated || "").trim()) score += 1;
+
+  return score;
+}
+
+function choosePreferredTask(current: any, incoming: any) {
+  if (!current) return incoming;
+  if (!incoming) return current;
+
+  const currentScore = taskPreferenceScore(current);
+  const incomingScore = taskPreferenceScore(incoming);
+
+  if (incomingScore !== currentScore) {
+    return incomingScore > currentScore ? incoming : current;
+  }
+
+  const currentUpdated = new Date(
+    current?.updated_at || current?.date_updated || current?.created_at || 0,
+  ).getTime();
+  const incomingUpdated = new Date(
+    incoming?.updated_at || incoming?.date_updated || incoming?.created_at || 0,
+  ).getTime();
+
+  if (Number.isFinite(incomingUpdated) && Number.isFinite(currentUpdated)) {
+    return incomingUpdated >= currentUpdated ? incoming : current;
+  }
+
+  return incoming;
+}
+
 function dedupeTasks(tasks: any[]) {
-  const seen = new Set<string>();
+  const byKey = new Map<string, any>();
+  const fallbackKeys = new Set<string>();
   const out: any[] = [];
 
-  for (const task of tasks) {
-    const key =
-      String(task?.clickup_task_id || task?.id || "").trim() ||
-      [
-        String(task?.client_id || "")
-          .trim()
-          .toLowerCase(),
-        String(task?.title || task?.name || "")
-          .trim()
-          .toLowerCase(),
-        String(task?.description || "")
-          .trim()
-          .toLowerCase(),
-      ].join("::");
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const key = buildTaskIdentityKey(task);
 
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (key) {
+      byKey.set(key, choosePreferredTask(byKey.get(key), task));
+      continue;
+    }
+
+    const fallbackKey = [
+      normalizeTaskIdentityPart(task?.client_id || task?.client_name || ""),
+      normalizeTaskIdentityPart(task?.title || task?.name || ""),
+      normalizeTaskIdentityPart(task?.description || ""),
+    ].join("::");
+
+    if (fallbackKeys.has(fallbackKey)) continue;
+    fallbackKeys.add(fallbackKey);
     out.push(task);
   }
 
-  return out;
+  return [...Array.from(byKey.values()), ...out];
 }
 
 function extractAssigneeIds(task: any) {
@@ -361,6 +445,12 @@ function normalizeDbTask(row: any, schema: TasksSchemaInfo) {
     assignee: schema.hasAssignee ? row.assignee || "" : "",
     assignee_ids: assigneeIds,
     due_date: schema.hasDueDate ? row.due_date || null : null,
+    sop_id: schema.hasSopId ? row.sop_id || null : null,
+    sop_title: schema.hasSopTitle ? row.sop_title || null : null,
+    sop_url: schema.hasSopUrl ? row.sop_url || null : null,
+    billing_dependency: schema.hasBillingDependency
+      ? row.billing_dependency || null
+      : null,
   };
 }
 
@@ -380,6 +470,232 @@ async function findTaskByAnyId(taskId: string) {
   );
 
   return found.rows?.[0] || null;
+}
+
+function isClosingStatus(value: any) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return ["complete", "completed", "closed"].includes(normalized);
+}
+
+async function clientExistsForTask(clientId: string) {
+  const id = String(clientId || "").trim();
+  if (!id) return false;
+
+  if (/^whmcs-\d+$/i.test(id)) {
+    const whmcsId = Number(String(id).replace(/^whmcs-/i, ""));
+    const foundWhmcs = await query(
+      `
+      SELECT 1
+      FROM whmcs_clients_cache
+      WHERE whmcs_client_id = $1
+      LIMIT 1
+      `,
+      [whmcsId],
+    ).catch(() => ({ rows: [] }) as any);
+    return Boolean(foundWhmcs.rows?.[0]);
+  }
+
+  const foundLocal = await query(
+    `
+    SELECT 1
+    FROM clients
+    WHERE id::text = $1
+    LIMIT 1
+    `,
+    [id],
+  ).catch(() => ({ rows: [] }) as any);
+
+  if (foundLocal.rows?.[0]) return true;
+
+  const foundWhmcsBySynthetic = await query(
+    `
+    SELECT 1
+    FROM whmcs_clients_cache
+    WHERE whmcs_client_id::text = $1
+    LIMIT 1
+    `,
+    [id],
+  ).catch(() => ({ rows: [] }) as any);
+
+  return Boolean(foundWhmcsBySynthetic.rows?.[0]);
+}
+
+async function getClientBillingBlockInfo(clientId: string) {
+  const id = String(clientId || "").trim();
+  if (!id) return { blocked: false, reason: "" };
+
+  let whmcsClientId: number | null = null;
+
+  if (/^whmcs-\d+$/i.test(id)) {
+    whmcsClientId = Number(String(id).replace(/^whmcs-/i, ""));
+  } else {
+    const mapped = await query(
+      `
+      SELECT whmcs_client_id
+      FROM clients
+      WHERE id::text = $1
+      LIMIT 1
+      `,
+      [id],
+    ).catch(() => ({ rows: [] }) as any);
+    whmcsClientId = Number(mapped.rows?.[0]?.whmcs_client_id || 0) || null;
+  }
+
+  if (!whmcsClientId) return { blocked: false, reason: "" };
+
+  const invoiceAgg = await query(
+    `
+    SELECT
+      COUNT(*) FILTER (
+        WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Overdue', 'Payment Pending'])
+      )::int AS overdue_invoices,
+      COALESCE(SUM(
+        CASE
+          WHEN COALESCE(status, '') ILIKE 'Paid' THEN 0
+          ELSE COALESCE(balance, total, 0)
+        END
+      ), 0) AS balance_due
+    FROM whmcs_invoices_cache
+    WHERE whmcs_client_id = $1
+    `,
+    [whmcsClientId],
+  ).catch(() => ({ rows: [{ overdue_invoices: 0, balance_due: 0 }] }) as any);
+
+  const overdueInvoices = Number(invoiceAgg.rows?.[0]?.overdue_invoices || 0);
+  const balanceDue = Number(invoiceAgg.rows?.[0]?.balance_due || 0);
+
+  if (overdueInvoices > 0 || balanceDue > 0) {
+    return {
+      blocked: true,
+      reason:
+        overdueInvoices > 0
+          ? "No task close if invoice unpaid"
+          : "Billing dependency unresolved",
+    };
+  }
+
+  return { blocked: false, reason: "" };
+}
+
+async function clientHasSops(clientId: string) {
+  const id = String(clientId || "").trim();
+  if (!id) return false;
+
+  const result = await query(
+    `
+    SELECT COUNT(*)::int AS total
+    FROM sops
+    WHERE client_id = $1
+    `,
+    [id],
+  ).catch((e: any) => {
+    if (e?.code === "42P01") return { rows: [{ total: 0 }] } as any;
+    throw e;
+  });
+
+  return Number(result.rows?.[0]?.total || 0) > 0;
+}
+
+async function resolveSopReference(args: {
+  clientId: string;
+  sopId?: string | null;
+  sopTitle?: string | null;
+  sopUrl?: string | null;
+}) {
+  const clientId = String(args.clientId || "").trim();
+  const incomingId = String(args.sopId || "").trim();
+  const incomingTitle = String(args.sopTitle || "").trim();
+  const incomingUrl = String(args.sopUrl || "").trim();
+
+  const fallback = {
+    sopId: incomingId || null,
+    sopTitle: incomingTitle || null,
+    sopUrl: incomingUrl || null,
+    source: incomingId || incomingTitle || incomingUrl ? "manual" : null,
+    found: false,
+  };
+
+  if (!clientId) return fallback;
+
+  try {
+    if (incomingId) {
+      const byId = await query(
+        `
+        SELECT id, title, url, source
+        FROM sops
+        WHERE client_id = $1
+          AND id::text = $2
+        LIMIT 1
+        `,
+        [clientId, incomingId],
+      );
+      const row = byId.rows?.[0];
+      if (row) {
+        return {
+          sopId: String(row.id || incomingId),
+          sopTitle: String(row.title || incomingTitle || "").trim() || null,
+          sopUrl: String(row.url || incomingUrl || "").trim() || null,
+          source: String(row.source || "manual").trim() || "manual",
+          found: true,
+        };
+      }
+    }
+
+    if (incomingTitle || incomingUrl) {
+      const byLoose = await query(
+        `
+        SELECT id, title, url, source
+        FROM sops
+        WHERE client_id = $1
+          AND (
+            ($2 <> '' AND LOWER(COALESCE(title, '')) = LOWER($2))
+            OR ($3 <> '' AND COALESCE(url, '') = $3)
+          )
+        ORDER BY created_at DESC NULLS LAST
+        LIMIT 1
+        `,
+        [clientId, incomingTitle, incomingUrl],
+      );
+      const row = byLoose.rows?.[0];
+      if (row) {
+        return {
+          sopId: String(row.id || incomingId || "").trim() || null,
+          sopTitle: String(row.title || incomingTitle || "").trim() || null,
+          sopUrl: String(row.url || incomingUrl || "").trim() || null,
+          source: String(row.source || "manual").trim() || "manual",
+          found: true,
+        };
+      }
+    }
+  } catch (e: any) {
+    if (e?.code !== "42P01") {
+      console.warn("[tasks] SOP lookup skipped:", e?.message || e);
+    }
+  }
+
+  return fallback;
+}
+
+function getTaskSopState(taskLike: any, hasClientSops: boolean) {
+  const sopId = String(taskLike?.sop_id || "").trim();
+  const sopTitle = String(taskLike?.sop_title || "").trim();
+  const sopUrl = String(taskLike?.sop_url || "").trim();
+  const linked = Boolean(sopId || sopTitle || sopUrl);
+  const gap = hasClientSops && !linked;
+
+  return {
+    sop_required: hasClientSops,
+    sop_linked: linked,
+    sop_gap: gap,
+    sop_recommendation: gap
+      ? "Attach an SOP reference to keep execution consistent."
+      : linked
+        ? "SOP linked."
+        : null,
+    sharepoint_fallback: !isSharePointConfigured(),
+  };
 }
 
 async function syncDbWithClickUp(args: {
@@ -474,6 +790,17 @@ async function syncDbWithClickUp(args: {
       ).catch((e: any) => {
         console.warn("[tasks] ClickUp update sync skipped:", e?.message || e);
       });
+
+      await query(
+        `
+        DELETE FROM tasks a
+        USING tasks b
+        WHERE a.id < b.id
+          AND a.client_id = b.client_id
+          AND COALESCE(a.clickup_task_id, '') <> ''
+          AND a.clickup_task_id = b.clickup_task_id
+        `,
+      ).catch(() => null);
     } else {
       await query(
         `
@@ -679,8 +1006,8 @@ router.get("/", async (req, res) => {
     };
   });
 
-  const tasks = dedupeTasks([...mergedRemote, ...normalizedDb]).map(
-    (task: any) => ({
+  const tasks = dedupeTasks(
+    [...mergedRemote, ...normalizedDb].map((task: any) => ({
       ...task,
       name: task?.name || task?.title || "Untitled Task",
       title: task?.title || task?.name || "Untitled Task",
@@ -690,7 +1017,7 @@ router.get("/", async (req, res) => {
       due_date: normalizeDueDateInput(task?.due_date),
       client_id: String(task?.client_id || "").trim(),
       client_name: String(task?.client_name || "").trim(),
-    }),
+    })),
   );
 
   for (const task of tasks) {
@@ -726,12 +1053,41 @@ router.post("/", requireAuth, async (req: any, res) => {
   const dueDate = normalizeDueDateInput(
     req.body?.dueDate ?? req.body?.due_date,
   );
+  const sopIdInput = String(req.body?.sopId || "").trim();
+  const sopTitleInput = String(req.body?.sopTitle || "").trim();
+  const sopUrlInput = String(req.body?.sopUrl || "").trim();
+  const billingDependency = String(req.body?.billingDependency || "").trim();
 
   if (!clientId || !title) {
     return res.status(400).json({ ok: false, error: "Missing fields" });
   }
 
   const schema = await ensureTasksTable();
+
+  if (!(await clientExistsForTask(clientId))) {
+    return res.status(400).json({
+      ok: false,
+      error: "Tasks must be linked to a valid client. No orphan tasks allowed.",
+    });
+  }
+
+  const resolvedSop = await resolveSopReference({
+    clientId,
+    sopId: sopIdInput,
+    sopTitle: sopTitleInput,
+    sopUrl: sopUrlInput,
+  });
+  const sopId = String(resolvedSop.sopId || "").trim();
+  const sopTitle = String(resolvedSop.sopTitle || "").trim();
+  const sopUrl = String(resolvedSop.sopUrl || "").trim();
+
+  if ((await clientHasSops(clientId)) && !sopId && !sopTitle && !sopUrl) {
+    return res.status(400).json({
+      ok: false,
+      error: "This client requires an SOP reference before task creation.",
+    });
+  }
+
   const clientName = await resolveClientName(clientId);
 
   let clickup: any = null;
@@ -811,22 +1167,26 @@ router.post("/", requireAuth, async (req: any, res) => {
     const updated = await query(updateSql, updateValues);
     const task = normalizeDbTask(updated.rows[0], schema);
 
+    const responseTask = {
+      ...task,
+      ...(clickup?.id
+        ? {
+            status:
+              String(clickup?.status || "not started").trim() || "not started",
+            source: "clickup",
+            clickup_task_id: clickup.id,
+            assignee: extractAssignee(clickup) || assignee,
+            assignee_ids: extractAssigneeIds(clickup) || assigneeIds,
+            due_date: clickup?.due_date || dueDate || null,
+          }
+        : {}),
+    };
+
     return res.json({
       ok: true,
       task: {
-        ...task,
-        ...(clickup?.id
-          ? {
-              status:
-                String(clickup?.status || "not started").trim() ||
-                "not started",
-              source: "clickup",
-              clickup_task_id: clickup.id,
-              assignee: extractAssignee(clickup) || assignee,
-              assignee_ids: extractAssigneeIds(clickup) || assigneeIds,
-              due_date: clickup?.due_date || dueDate || null,
-            }
-          : {}),
+        ...responseTask,
+        ...getTaskSopState(responseTask, await clientHasSops(clientId)),
       },
     });
   }
@@ -870,6 +1230,26 @@ router.post("/", requireAuth, async (req: any, res) => {
     insertValues.push(clickup?.due_date || dueDate || null);
   }
 
+  if (schema.hasSopId) {
+    insertColumns.push("sop_id");
+    insertValues.push(sopId || null);
+  }
+
+  if (schema.hasSopTitle) {
+    insertColumns.push("sop_title");
+    insertValues.push(sopTitle || null);
+  }
+
+  if (schema.hasSopUrl) {
+    insertColumns.push("sop_url");
+    insertValues.push(sopUrl || null);
+  }
+
+  if (schema.hasBillingDependency) {
+    insertColumns.push("billing_dependency");
+    insertValues.push(billingDependency || null);
+  }
+
   const insertSql = `
     INSERT INTO tasks (${insertColumns.join(", ")})
     VALUES (${insertValues.map((_, index) => `$${index + 1}`).join(", ")})
@@ -879,21 +1259,26 @@ router.post("/", requireAuth, async (req: any, res) => {
   const r = await query(insertSql, insertValues);
   const task = normalizeDbTask(r.rows[0], schema);
 
+  const responseTask = {
+    ...task,
+    ...(clickup?.id
+      ? {
+          status:
+            String(clickup?.status || "not started").trim() || "not started",
+          source: "clickup",
+          clickup_task_id: clickup.id,
+          assignee: extractAssignee(clickup) || assignee,
+          assignee_ids: extractAssigneeIds(clickup) || assigneeIds,
+          due_date: clickup?.due_date || dueDate || null,
+        }
+      : {}),
+  };
+
   res.json({
     ok: true,
     task: {
-      ...task,
-      ...(clickup?.id
-        ? {
-            status:
-              String(clickup?.status || "not started").trim() || "not started",
-            source: "clickup",
-            clickup_task_id: clickup.id,
-            assignee: extractAssignee(clickup) || assignee,
-            assignee_ids: extractAssigneeIds(clickup) || assigneeIds,
-            due_date: clickup?.due_date || dueDate || null,
-          }
-        : {}),
+      ...responseTask,
+      ...getTaskSopState(responseTask, await clientHasSops(clientId)),
     },
   });
 });
@@ -1136,6 +1521,16 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
   );
   const clientId =
     req.body?.clientId != null ? String(req.body.clientId || "").trim() : "";
+  const sopIdInput =
+    req.body?.sopId != null ? String(req.body.sopId || "").trim() : "";
+  const sopTitleInput =
+    req.body?.sopTitle != null ? String(req.body.sopTitle || "").trim() : "";
+  const sopUrlInput =
+    req.body?.sopUrl != null ? String(req.body.sopUrl || "").trim() : "";
+  const billingDependency =
+    req.body?.billingDependency != null
+      ? String(req.body.billingDependency || "").trim()
+      : "";
 
   if (!id) {
     return res.status(400).json({ ok: false, error: "id is required" });
@@ -1176,9 +1571,61 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
       ? clientId
       : String(task?.client_id || "").trim();
 
+  if (!nextClientId || !(await clientExistsForTask(nextClientId))) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Tasks must stay linked to a valid client. No orphan tasks allowed.",
+    });
+  }
+
+  const resolvedSop = await resolveSopReference({
+    clientId: nextClientId,
+    sopId:
+      req.body?.sopId !== undefined ? sopIdInput : String(task?.sop_id || ""),
+    sopTitle:
+      req.body?.sopTitle !== undefined
+        ? sopTitleInput
+        : String(task?.sop_title || ""),
+    sopUrl:
+      req.body?.sopUrl !== undefined
+        ? sopUrlInput
+        : String(task?.sop_url || ""),
+  });
+  const sopId = String(resolvedSop.sopId || "").trim();
+  const sopTitle = String(resolvedSop.sopTitle || "").trim();
+  const sopUrl = String(resolvedSop.sopUrl || "").trim();
+
+  if (
+    (await clientHasSops(nextClientId)) &&
+    !(
+      sopId ||
+      task?.sop_id ||
+      sopTitle ||
+      task?.sop_title ||
+      sopUrl ||
+      task?.sop_url
+    )
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "This client requires an SOP reference before saving the task.",
+    });
+  }
+
   let nextClientName = nextClientId
     ? await resolveClientName(nextClientId)
     : String(task?.client_name || "").trim();
+
+  const billingBlockInfo = await getClientBillingBlockInfo(nextClientId);
+  if (isClosingStatus(nextStatus) && billingBlockInfo.blocked) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        billingBlockInfo.reason ||
+        "Task completion blocked by billing dependency.",
+    });
+  }
 
   let updatedClickUp: any = null;
 
@@ -1261,6 +1708,31 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     values.push(nextDueDate);
   }
 
+  if (schema.hasSopId) {
+    updateSets.push(`sop_id = $${values.length + 1}`);
+    values.push(sopId || task?.sop_id || null);
+  }
+
+  if (schema.hasSopTitle) {
+    updateSets.push(`sop_title = $${values.length + 1}`);
+    values.push(sopTitle || task?.sop_title || null);
+  }
+
+  if (schema.hasSopUrl) {
+    updateSets.push(`sop_url = $${values.length + 1}`);
+    values.push(sopUrl || task?.sop_url || null);
+  }
+
+  if (schema.hasBillingDependency) {
+    updateSets.push(`billing_dependency = $${values.length + 1}`);
+    values.push(
+      billingDependency ||
+        (billingBlockInfo.blocked
+          ? billingBlockInfo.reason || "Billing dependency unresolved"
+          : task?.billing_dependency || null),
+    );
+  }
+
   values.push(task.id);
 
   const setClause = updateSets.join(", ");
@@ -1276,25 +1748,37 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
 
   const normalized = normalizeDbTask(updated.rows[0], schema);
 
+  const responseTask = {
+    ...normalized,
+    clickup_task_id:
+      task.clickup_task_id || normalized?.clickup_task_id || null,
+    client_name: nextClientName || String(normalized?.client_name || "").trim(),
+    assignee: nextAssignee,
+    assignee_ids: nextAssigneeIds,
+    due_date: nextDueDate,
+    sop_id: sopId || task?.sop_id || null,
+    sop_title: sopTitle || task?.sop_title || null,
+    sop_url: sopUrl || task?.sop_url || null,
+    billing_dependency:
+      billingDependency ||
+      (billingBlockInfo.blocked
+        ? billingBlockInfo.reason || "Billing dependency unresolved"
+        : task?.billing_dependency || null),
+    ...(updatedClickUp
+      ? {
+          status: nextStatus,
+          assignees: Array.isArray(updatedClickUp?.assignees)
+            ? updatedClickUp.assignees
+            : [],
+        }
+      : {}),
+  };
+
   res.json({
     ok: true,
     task: {
-      ...normalized,
-      clickup_task_id:
-        task.clickup_task_id || normalized?.clickup_task_id || null,
-      client_name:
-        nextClientName || String(normalized?.client_name || "").trim(),
-      assignee: nextAssignee,
-      assignee_ids: nextAssigneeIds,
-      due_date: nextDueDate,
-      ...(updatedClickUp
-        ? {
-            status: nextStatus,
-            assignees: Array.isArray(updatedClickUp?.assignees)
-              ? updatedClickUp.assignees
-              : [],
-          }
-        : {}),
+      ...responseTask,
+      ...getTaskSopState(responseTask, await clientHasSops(nextClientId)),
     },
   });
 });
@@ -1314,6 +1798,18 @@ router.patch("/:id/status", requireAuth, async (req: any, res) => {
 
   if (!task) {
     return res.status(404).json({ ok: false, error: "Task not found" });
+  }
+
+  const billingBlockInfo = await getClientBillingBlockInfo(
+    String(task?.client_id || "").trim(),
+  );
+  if (isClosingStatus(status) && billingBlockInfo.blocked) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        billingBlockInfo.reason ||
+        "Task completion blocked by billing dependency.",
+    });
   }
 
   let clickupTask: any = null;
@@ -1345,9 +1841,17 @@ router.patch("/:id/status", requireAuth, async (req: any, res) => {
     [nextStatus, task.id],
   );
 
+  const responseTask = normalizeDbTask(updated.rows[0], schema);
+
   res.json({
     ok: true,
-    task: normalizeDbTask(updated.rows[0], schema),
+    task: {
+      ...responseTask,
+      ...getTaskSopState(
+        responseTask,
+        await clientHasSops(String(task?.client_id || "").trim()),
+      ),
+    },
   });
 });
 
