@@ -181,6 +181,62 @@ function rowToItem(row: any) {
   };
 }
 
+router.get("/summary/:clientId", optionalAuth, async (req: any, res) => {
+  try {
+    if (authReadRequired() && !req.user) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+
+    await ensureCommunicationsTable();
+    const clientId = safeTrim(req.params.clientId);
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "clientId required" });
+    }
+
+    const r = await query(
+      `
+      SELECT
+        id, client_id, type, title, body, direction, channel, source, source_ref,
+        status, priority, sentiment, created_by, created_at, updated_at
+      FROM communications_timeline
+      WHERE client_id = $1
+      ORDER BY created_at DESC
+      LIMIT 60
+      `,
+      [clientId],
+    ).catch((e: any) => {
+      if (isPgUndefinedTable(e)) return { rows: [] as any[] };
+      throw e;
+    });
+
+    const items = (r.rows || []).map(rowToItem);
+    const summary = buildCommunicationSummary(items);
+
+    return res.json({
+      ok: true,
+      clientId,
+      generated_at: new Date().toISOString(),
+      summary: summary.summary,
+      metrics: {
+        total_entries: summary.total,
+        unresolved_count: summary.unresolved_count,
+        urgent_count: summary.urgent_count,
+        negative_count: summary.negative_count,
+      },
+      next_actions: summary.next_actions,
+      counts_by_type: summary.counts_by_type,
+      counts_by_channel: summary.counts_by_channel,
+      latest_at: summary.latest_at,
+    });
+  } catch (e: any) {
+    console.error("[communications] summary error", e);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to summarize communications timeline",
+    });
+  }
+});
+
 router.get("/:clientId", optionalAuth, async (req: any, res) => {
   try {
     if (authReadRequired() && !req.user) {
@@ -305,58 +361,120 @@ router.post("/:clientId", requireAuth, async (req: any, res) => {
   }
 });
 
-router.get("/summary/:clientId", optionalAuth, async (req: any, res) => {
+router.patch("/item/:id", requireAuth, async (req: any, res) => {
   try {
-    if (authReadRequired() && !req.user) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
-
     await ensureCommunicationsTable();
-    const clientId = safeTrim(req.params.clientId);
-    if (!clientId) {
-      return res.status(400).json({ ok: false, error: "clientId required" });
+    const id = safeTrim(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: "id required" });
+
+    const existing = await query(
+      `
+      SELECT id, client_id, type, title, body, direction, channel, source, source_ref,
+             status, priority, sentiment, created_by, created_at, updated_at
+      FROM communications_timeline
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [id],
+    );
+
+    if (!existing.rows?.[0]) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Communication entry not found" });
     }
 
-    const r = await query(
+    const prev = rowToItem(existing.rows[0]);
+    const updated = await query(
       `
-      SELECT
+      UPDATE communications_timeline
+      SET
+        type = COALESCE($2, type),
+        title = COALESCE($3, title),
+        body = COALESCE($4, body),
+        direction = COALESCE($5, direction),
+        channel = COALESCE($6, channel),
+        source = COALESCE($7, source),
+        source_ref = COALESCE($8, source_ref),
+        status = COALESCE($9, status),
+        priority = COALESCE($10, priority),
+        sentiment = COALESCE($11, sentiment),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING
         id, client_id, type, title, body, direction, channel, source, source_ref,
         status, priority, sentiment, created_by, created_at, updated_at
-      FROM communications_timeline
-      WHERE client_id = $1
-      ORDER BY created_at DESC
-      LIMIT 60
       `,
-      [clientId],
-    ).catch((e: any) => {
-      if (isPgUndefinedTable(e)) return { rows: [] as any[] };
-      throw e;
+      [
+        id,
+        safeTrim(req.body?.type || "") || null,
+        safeTrim(req.body?.title || "") || null,
+        safeTrim(req.body?.body || "") || null,
+        safeTrim(req.body?.direction || "") || null,
+        safeTrim(req.body?.channel || "") || null,
+        safeTrim(req.body?.source || "") || null,
+        safeTrim(req.body?.sourceRef || "") || null,
+        safeTrim(req.body?.status || "") || null,
+        safeTrim(req.body?.priority || "") || null,
+        safeTrim(req.body?.sentiment || "") || null,
+      ],
+    );
+
+    const item = rowToItem(updated.rows?.[0] || {});
+    await writeAudit({
+      user_id: req.user.id,
+      action: "update",
+      entity: "communication_timeline",
+      entity_id: item.id,
+      client_id: item.client_id,
+      meta: { before: prev, after: item },
+      ip: req.ip,
     });
 
-    const items = (r.rows || []).map(rowToItem);
-    const summary = buildCommunicationSummary(items);
-
-    return res.json({
-      ok: true,
-      clientId,
-      generated_at: new Date().toISOString(),
-      summary: summary.summary,
-      metrics: {
-        total_entries: summary.total,
-        unresolved_count: summary.unresolved_count,
-        urgent_count: summary.urgent_count,
-        negative_count: summary.negative_count,
-      },
-      next_actions: summary.next_actions,
-      counts_by_type: summary.counts_by_type,
-      counts_by_channel: summary.counts_by_channel,
-      latest_at: summary.latest_at,
-    });
+    return res.json({ ok: true, item });
   } catch (e: any) {
-    console.error("[communications] summary error", e);
+    console.error("[communications] update error", e);
     return res.status(500).json({
       ok: false,
-      error: e?.message || "Failed to summarize communications timeline",
+      error: e?.message || "Failed to update communication timeline entry",
+    });
+  }
+});
+
+router.delete("/item/:id", requireAuth, async (req: any, res) => {
+  try {
+    await ensureCommunicationsTable();
+    const id = safeTrim(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: "id required" });
+
+    const existing = await query(
+      `SELECT id, client_id FROM communications_timeline WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+    if (!existing.rows?.[0]) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Communication entry not found" });
+    }
+
+    await query(`DELETE FROM communications_timeline WHERE id = $1`, [id]);
+
+    await writeAudit({
+      user_id: req.user.id,
+      action: "delete",
+      entity: "communication_timeline",
+      entity_id: id,
+      client_id: String(existing.rows[0].client_id || ""),
+      meta: { deleted: true },
+      ip: req.ip,
+    });
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("[communications] delete error", e);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to delete communication timeline entry",
     });
   }
 });
