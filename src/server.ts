@@ -13,7 +13,7 @@ import sopsRouter from "./routes/sops.js";
 import authRouter from "./routes/auth.js";
 import sharepointRouter from "./routes/sharepoint.js";
 
-import { runWhmcsSyncOnce } from "./jobs/whmcsSync.js";
+import { runWhmcsSyncOnce, startWhmcsAutoSync } from "./jobs/whmcsSync.js";
 
 const app = express();
 
@@ -38,9 +38,15 @@ app.use("/sharepoint", sharepointRouter);
 app.use("/sops", sopsRouter);
 app.use("/auth", authRouter);
 
-app.post("/sync/whmcs/run-once", async (_req, res) => {
+async function handleWhmcsRunOnce(
+  _req: express.Request,
+  res: express.Response,
+) {
   try {
-    const result = await runWhmcsSyncOnce();
+    const result = await runWhmcsSyncOnce({
+      trigger: "manual",
+      initiatedBy: "legacy-route",
+    });
     return res.json({ ok: true, result });
   } catch (e: any) {
     console.error("[sync] run-once error:", e);
@@ -48,7 +54,13 @@ app.post("/sync/whmcs/run-once", async (_req, res) => {
       .status(500)
       .json({ ok: false, error: e?.message || "sync failed" });
   }
-});
+}
+
+// Keep the original route for backward compatibility.
+app.post("/sync/whmcs/run-once", handleWhmcsRunOnce);
+
+// Add the simpler alias used by the frontend sync action.
+app.post("/sync/whmcs/run", handleWhmcsRunOnce);
 
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error("[server] unhandled:", err);
@@ -61,6 +73,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 if (process.env.NLM_API_NO_LISTEN !== "1") {
   app.listen(PORT, HOST, () => {
     console.log(`[api] listening on http://${HOST}:${PORT}`);
+    startWhmcsAutoSync();
   });
 }
 

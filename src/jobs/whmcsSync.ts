@@ -486,6 +486,27 @@ async function upsertClientCache(row: any) {
   );
 }
 
+async function syncLinkedLocalClientStatus(row: any) {
+  const whmcsClientId = Number(row?.id);
+  if (!Number.isFinite(whmcsClientId) || whmcsClientId <= 0) return;
+
+  const normalizedStatus = String(normalizeStatus(row?.status) || "")
+    .trim()
+    .toLowerCase();
+
+  if (!normalizedStatus) return;
+
+  await query(
+    `
+    UPDATE clients
+    SET status = $2
+    WHERE whmcs_client_id = $1
+      AND COALESCE(NULLIF(TRIM(status), ''), '') <> $2
+    `,
+    [whmcsClientId, normalizedStatus],
+  ).catch(() => {});
+}
+
 async function upsertInvoiceCache(whmcsClientId: number, row: any) {
   const invoiceId = Number(row?.id ?? row?.invoiceid ?? row?.invoice_id);
   if (!Number.isFinite(invoiceId) || invoiceId <= 0) return;
@@ -594,108 +615,225 @@ async function cleanupStaleCaches(activeClientIds: number[]) {
 
 /* ───────────────────────── main job ───────────────────────── */
 
-export async function runWhmcsSyncOnce() {
-  if (!envBool("WHMCS_SYNC_ENABLED", true)) {
-    return {
-      ok: true,
-      skipped: true,
-      reason: "WHMCS_SYNC_ENABLED is false",
-    };
+type WhmcsRunOptions = {
+  trigger?: "manual" | "auto" | "startup";
+  initiatedBy?: string | null;
+};
+
+function autoSyncEnabled() {
+  return envBool("WHMCS_AUTO_SYNC_ENABLED", true);
+}
+
+function autoSyncIntervalMs() {
+  return Math.max(60_000, envNum("WHMCS_AUTO_SYNC_INTERVAL_MS", 5 * 60_000));
+}
+
+function autoSyncRunOnStartup() {
+  return envBool("WHMCS_AUTO_SYNC_RUN_ON_STARTUP", true);
+}
+
+const AUTO_SYNC_STATE = {
+  enabled: false,
+  intervalMs: 0,
+  timerStarted: false,
+  running: false,
+  lastAttemptAt: null as string | null,
+  lastSuccessAt: null as string | null,
+  lastError: null as string | null,
+};
+
+let whmcsSyncTimer: ReturnType<typeof setInterval> | null = null;
+let currentRunPromise: Promise<any> | null = null;
+
+export function getWhmcsAutoSyncConfig() {
+  return {
+    whmcs_auto_sync_enabled: autoSyncEnabled(),
+    whmcs_auto_sync_interval_ms: autoSyncIntervalMs(),
+    whmcs_auto_sync_run_on_startup: autoSyncRunOnStartup(),
+  };
+}
+
+export function getWhmcsAutoSyncState() {
+  return {
+    ...AUTO_SYNC_STATE,
+  };
+}
+
+export async function runWhmcsSyncOnce(options: WhmcsRunOptions = {}) {
+  if (currentRunPromise) {
+    return currentRunPromise;
   }
 
-  const kind = "whmcs_full_sync";
-  const source = "whmcs";
-
-  await ensureTables();
-
-  const runId = await startRun(kind, source);
-  const stats: any = {
-    kind,
-    source,
-    clients_seen: 0,
-    clients_upserted: 0,
-    invoices_upserted: 0,
-    services_upserted: 0,
-    services_failed_clients: 0,
-    services_failed_client_ids: [] as number[],
-    services_failed_reasons: [] as Array<{ client_id: number; error: string }>,
-    cache_clients: 0,
-    cache_invoices: 0,
-    cache_services: 0,
-  };
-
-  try {
-    const clients = await fetchAllClients();
-    stats.clients_seen = clients.length;
-
-    const activeClientIds: number[] = [];
-
-    for (const c of clients) {
-      const whmcsId = Number(c?.id);
-      if (!Number.isFinite(whmcsId) || whmcsId <= 0) continue;
-
-      activeClientIds.push(whmcsId);
-
-      await upsertClientCache(c);
-      stats.clients_upserted++;
-
-      const invoices = await fetchInvoicesForClient(whmcsId);
-      for (const inv of invoices) {
-        await upsertInvoiceCache(whmcsId, inv);
-        stats.invoices_upserted++;
-      }
-
-      try {
-        const services = await fetchServicesForClient(whmcsId);
-        for (const svc of services) {
-          await upsertServiceCache(whmcsId, svc);
-          stats.services_upserted++;
-        }
-      } catch (e: any) {
-        const message = String(e?.message || e || "unknown error");
-
-        if (isUtf8JsonErrorMessage(message)) {
-          stats.services_failed_clients++;
-          stats.services_failed_client_ids.push(whmcsId);
-          stats.services_failed_reasons.push({
-            client_id: whmcsId,
-            error: message,
-          });
-
-          console.warn(
-            `[whmcs-sync] skipping services for client ${whmcsId} due to malformed WHMCS UTF-8 data`,
-          );
-          continue;
-        }
-
-        throw e;
-      }
+  currentRunPromise = (async () => {
+    if (!envBool("WHMCS_SYNC_ENABLED", true)) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "WHMCS_SYNC_ENABLED is false",
+      };
     }
 
-    await cleanupStaleCaches(activeClientIds);
+    const kind = "whmcs_full_sync";
+    const source = "whmcs";
 
-    const cc = await query<{ n: number }>(
-      `SELECT COUNT(*)::int AS n FROM whmcs_clients_cache`,
-    );
-    const ic = await query<{ n: number }>(
-      `SELECT COUNT(*)::int AS n FROM whmcs_invoices_cache`,
-    );
-    const sc = await query<{ n: number }>(
-      `SELECT COUNT(*)::int AS n FROM whmcs_services_cache`,
-    );
+    await ensureTables();
 
-    stats.cache_clients = cc.rows?.[0]?.n ?? 0;
-    stats.cache_invoices = ic.rows?.[0]?.n ?? 0;
-    stats.cache_services = sc.rows?.[0]?.n ?? 0;
+    const runId = await startRun(kind, source);
+    const stats: any = {
+      kind,
+      source,
+      trigger: options.trigger || "manual",
+      initiated_by: options.initiatedBy || null,
+      clients_seen: 0,
+      clients_upserted: 0,
+      invoices_upserted: 0,
+      services_upserted: 0,
+      services_failed_clients: 0,
+      services_failed_client_ids: [] as number[],
+      services_failed_reasons: [] as Array<{
+        client_id: number;
+        error: string;
+      }>,
+      cache_clients: 0,
+      cache_invoices: 0,
+      cache_services: 0,
+    };
 
-    await finishRun(runId, true, stats);
-    return { ok: true, runId, stats };
-  } catch (e: any) {
-    await finishRun(runId, false, stats, e);
-    throw e;
+    AUTO_SYNC_STATE.running = true;
+    AUTO_SYNC_STATE.lastAttemptAt = new Date().toISOString();
+    AUTO_SYNC_STATE.lastError = null;
+
+    try {
+      const clients = await fetchAllClients();
+      stats.clients_seen = clients.length;
+
+      const activeClientIds: number[] = [];
+
+      for (const c of clients) {
+        const whmcsId = Number(c?.id);
+        if (!Number.isFinite(whmcsId) || whmcsId <= 0) continue;
+
+        activeClientIds.push(whmcsId);
+
+        await upsertClientCache(c);
+        await syncLinkedLocalClientStatus(c);
+        stats.clients_upserted++;
+
+        const invoices = await fetchInvoicesForClient(whmcsId);
+        for (const inv of invoices) {
+          await upsertInvoiceCache(whmcsId, inv);
+          stats.invoices_upserted++;
+        }
+
+        try {
+          const services = await fetchServicesForClient(whmcsId);
+          for (const svc of services) {
+            await upsertServiceCache(whmcsId, svc);
+            stats.services_upserted++;
+          }
+        } catch (e: any) {
+          const message = String(e?.message || e || "unknown error");
+
+          if (isUtf8JsonErrorMessage(message)) {
+            stats.services_failed_clients++;
+            stats.services_failed_client_ids.push(whmcsId);
+            stats.services_failed_reasons.push({
+              client_id: whmcsId,
+              error: message,
+            });
+
+            console.warn(
+              `[whmcs-sync] skipping services for client ${whmcsId} due to malformed WHMCS UTF-8 data`,
+            );
+            continue;
+          }
+
+          throw e;
+        }
+      }
+
+      await cleanupStaleCaches(activeClientIds);
+
+      const cc = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM whmcs_clients_cache`,
+      );
+      const ic = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM whmcs_invoices_cache`,
+      );
+      const sc = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM whmcs_services_cache`,
+      );
+
+      stats.cache_clients = cc.rows?.[0]?.n ?? 0;
+      stats.cache_invoices = ic.rows?.[0]?.n ?? 0;
+      stats.cache_services = sc.rows?.[0]?.n ?? 0;
+
+      await finishRun(runId, true, stats);
+      AUTO_SYNC_STATE.lastSuccessAt = new Date().toISOString();
+
+      return { ok: true, runId, stats };
+    } catch (e: any) {
+      AUTO_SYNC_STATE.lastError = String(e?.message || e || "sync failed");
+      await finishRun(runId, false, stats, e);
+      throw e;
+    } finally {
+      AUTO_SYNC_STATE.running = false;
+    }
+  })();
+
+  try {
+    return await currentRunPromise;
+  } finally {
+    currentRunPromise = null;
   }
 }
 
 export async function runWhmcsSync() {
-  return runWhmcsSyncOnce();
+  return runWhmcsSyncOnce({ trigger: "manual", initiatedBy: "server" });
+}
+
+export function startWhmcsAutoSync() {
+  if (whmcsSyncTimer) {
+    return getWhmcsAutoSyncState();
+  }
+
+  const enabled = autoSyncEnabled();
+  const intervalMs = autoSyncIntervalMs();
+
+  AUTO_SYNC_STATE.enabled = enabled;
+  AUTO_SYNC_STATE.intervalMs = intervalMs;
+
+  if (!enabled) {
+    console.log("[whmcs-sync] auto sync disabled");
+    return getWhmcsAutoSyncState();
+  }
+
+  const tick = async (trigger: "auto" | "startup") => {
+    try {
+      await runWhmcsSyncOnce({
+        trigger,
+        initiatedBy:
+          trigger === "startup" ? "server-startup" : "auto-sync-timer",
+      });
+    } catch (e: any) {
+      AUTO_SYNC_STATE.lastError = String(e?.message || e || "sync failed");
+      console.error(`[whmcs-sync] ${trigger} run failed:`, e);
+    }
+  };
+
+  whmcsSyncTimer = setInterval(() => {
+    void tick("auto");
+  }, intervalMs);
+
+  AUTO_SYNC_STATE.timerStarted = true;
+
+  console.log(`[whmcs-sync] auto sync started (${intervalMs}ms interval)`);
+
+  if (autoSyncRunOnStartup()) {
+    setTimeout(() => {
+      void tick("startup");
+    }, 5_000);
+  }
+
+  return getWhmcsAutoSyncState();
 }

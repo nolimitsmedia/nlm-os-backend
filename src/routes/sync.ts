@@ -1,7 +1,12 @@
 // services/api/src/routes/sync.ts
 import { Router } from "express";
 import { query } from "../db.js";
-import { runWhmcsSyncOnce } from "../jobs/whmcsSync.js";
+import { getAuthUserFromReq, type AuthUser } from "../middleware/auth.js";
+import {
+  getWhmcsAutoSyncConfig,
+  getWhmcsAutoSyncState,
+  runWhmcsSyncOnce,
+} from "../jobs/whmcsSync.js";
 
 const router = Router();
 
@@ -25,22 +30,34 @@ function parseBool(value: any, fallback = false) {
   return ["1", "true", "yes", "on"].includes(v);
 }
 
+function hasAllowedRole(user: AuthUser | null) {
+  if (!user) return false;
+  const role = String(user.role || "")
+    .trim()
+    .toLowerCase();
+  return ["admin", "staff"].includes(role);
+}
+
 function isAuthorized(req: any) {
   const requiredToken = env("SYNC_ADMIN_TOKEN");
-  if (!requiredToken) return true;
-
   const authHeader = String(req.headers.authorization || "");
   const bearer = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7).trim()
     : "";
 
-  const token =
-    bearer ||
+  const syncToken =
     String(req.headers["x-sync-token"] || "") ||
     String(req.query.token || "") ||
-    String(req.body?.token || "");
+    String(req.body?.token || "") ||
+    "";
 
-  return token && token === requiredToken;
+  if (requiredToken) {
+    if (syncToken && syncToken === requiredToken) return true;
+    if (bearer && bearer === requiredToken) return true;
+  }
+
+  const user = getAuthUserFromReq(req);
+  return hasAllowedRole(user);
 }
 
 async function columnExists(table: string, column: string) {
@@ -80,6 +97,7 @@ router.get("/health", async (_req, res) => {
       whmcs_sync_page_size: Number(env("WHMCS_SYNC_PAGE_SIZE", "250")),
       whmcs_sync_timeout_ms: Number(env("WHMCS_SYNC_TIMEOUT_MS", "30000")),
       whmcs_sync_client_status: env("WHMCS_SYNC_CLIENT_STATUS") || null,
+      ...getWhmcsAutoSyncConfig(),
     };
 
     let lastRun: any = null;
@@ -103,6 +121,7 @@ router.get("/health", async (_req, res) => {
     res.json({
       ok: true,
       config,
+      autoSync: getWhmcsAutoSyncState(),
       lastRun,
     });
   } catch (e: any) {
@@ -160,6 +179,7 @@ router.get("/whmcs/status", async (_req, res) => {
       configured: hasWhmcsConfig(),
       counts,
       runs: runs.rows ?? [],
+      autoSync: getWhmcsAutoSyncState(),
     });
   } catch (e: any) {
     res.status(500).json({
@@ -187,7 +207,12 @@ router.post("/whmcs/run", async (req, res) => {
       });
     }
 
-    const result = await runWhmcsSyncOnce();
+    const result = await runWhmcsSyncOnce({
+      trigger: "manual",
+      initiatedBy:
+        (req.user && String(req.user.email || req.user.id || "")) ||
+        "dashboard",
+    });
 
     return res.json({
       ok: true,

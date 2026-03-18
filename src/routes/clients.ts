@@ -109,7 +109,7 @@ router.get("/", async (req, res) => {
         SELECT
           c.id,
           COALESCE(NULLIF(c.name, ''), w.company_name, c.id) AS name,
-          COALESCE(NULLIF(c.status, ''), LOWER(w.status), 'active') AS status,
+          COALESCE(LOWER(NULLIF(w.status, '')), NULLIF(LOWER(c.status), ''), 'active') AS status,
           c.whmcs_client_id,
           w.company_name AS whmcs_company_name,
           w.email AS whmcs_email,
@@ -273,7 +273,7 @@ router.get("/:id", async (req, res) => {
         SELECT
           c.id,
           COALESCE(NULLIF(c.name, ''), w.company_name, c.id) AS name,
-          COALESCE(NULLIF(c.status, ''), LOWER(w.status), 'active') AS status,
+          COALESCE(LOWER(NULLIF(w.status, '')), NULLIF(LOWER(c.status), ''), 'active') AS status,
           c.whmcs_client_id,
           c.created_at,
           c.updated_at,

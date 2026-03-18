@@ -77,7 +77,7 @@ router.get("/:id/overview", async (req, res) => {
         SELECT
           c.id,
           c.name,
-          c.status,
+          COALESCE(LOWER(NULLIF(w.status, '')), NULLIF(LOWER(c.status), ''), 'active') AS status,
           c.whmcs_client_id,
           w.company_name,
           w.email,
