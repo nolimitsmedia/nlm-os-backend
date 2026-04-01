@@ -94,7 +94,7 @@ router.get("/:id/overview", async (req, res) => {
         SELECT
           CONCAT('whmcs-', w.whmcs_client_id::text) AS id,
           COALESCE(NULLIF(w.company_name, ''), CONCAT('WHMCS #', w.whmcs_client_id::text)) AS name,
-          COALESCE(LOWER(NULLIF(w.status, '')), NULLIF(LOWER(c.status), ''), 'active') AS status,
+          COALESCE(LOWER(NULLIF(w.status, '')), 'active') AS status,
           w.whmcs_client_id,
           w.company_name,
           w.email,
