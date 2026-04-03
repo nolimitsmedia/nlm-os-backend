@@ -91,6 +91,79 @@ function buildBatch6Meta(rows: any[]) {
   };
 }
 
+async function getTaskSopUsageAnalytics(clientId: string) {
+  const taskRows = await query(
+    `
+    SELECT
+      COUNT(*)::int AS total_tasks,
+      COUNT(*) FILTER (
+        WHERE COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NOT NULL
+      )::int AS linked_tasks,
+      COUNT(*) FILTER (
+        WHERE COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NULL
+      )::int AS no_sop_tasks
+    FROM tasks
+    WHERE client_id = $1
+    `,
+    [clientId],
+  ).catch((e: any) => {
+    if (isPgUndefinedTable(e)) {
+      return {
+        rows: [{ total_tasks: 0, linked_tasks: 0, no_sop_tasks: 0 }],
+      } as any;
+    }
+    throw e;
+  });
+
+  const mostUsed = await query(
+    `
+    SELECT
+      COALESCE(NULLIF(TRIM(sop_title), ''), NULLIF(TRIM(sop_url), ''), 'Linked SOP') AS title,
+      COUNT(*)::int AS count
+    FROM tasks
+    WHERE client_id = $1
+      AND COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NOT NULL
+    GROUP BY 1
+    ORDER BY count DESC, title ASC
+    LIMIT 5
+    `,
+    [clientId],
+  ).catch((e: any) => {
+    if (isPgUndefinedTable(e)) return { rows: [] } as any;
+    throw e;
+  });
+
+  return {
+    total_tasks: Number(taskRows.rows?.[0]?.total_tasks || 0),
+    linked_tasks: Number(taskRows.rows?.[0]?.linked_tasks || 0),
+    no_sop_tasks: Number(taskRows.rows?.[0]?.no_sop_tasks || 0),
+    most_used_sops: Array.isArray(mostUsed.rows) ? mostUsed.rows : [],
+  };
+}
+
+async function getRecentSopUsage(clientId: string) {
+  const recentUsed = await query(
+    `
+    SELECT
+      COALESCE(NULLIF(TRIM(sop_title), ''), NULLIF(TRIM(sop_url), ''), 'Linked SOP') AS title,
+      MAX(updated_at) AS last_used_at,
+      COUNT(*)::int AS usage_count
+    FROM tasks
+    WHERE client_id = $1
+      AND COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NOT NULL
+    GROUP BY 1
+    ORDER BY MAX(updated_at) DESC NULLS LAST
+    LIMIT 5
+    `,
+    [clientId],
+  ).catch((e: any) => {
+    if (isPgUndefinedTable(e)) return { rows: [] } as any;
+    throw e;
+  });
+
+  return Array.isArray(recentUsed.rows) ? recentUsed.rows : [];
+}
+
 /**
  * GET /sops?clientId=...
  */
@@ -519,6 +592,61 @@ router.get("/:id/preview", optionalAuth, async (req: any, res) => {
       ok: false,
       error: e?.message || "Failed to load SOP preview",
     });
+  }
+});
+
+router.get("/analytics/:clientId", optionalAuth, async (req: any, res) => {
+  try {
+    if (authReadRequired() && !req.user) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+    const clientId = String(req.params?.clientId || "").trim();
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "clientId required" });
+    }
+    const fallback = getFallbackState();
+    const usage = await getTaskSopUsageAnalytics(clientId);
+    const recent = await getRecentSopUsage(clientId);
+    return res.json({
+      ok: true,
+      clientId,
+      configured: fallback.sharepoint_configured,
+      sharepoint_configured: fallback.sharepoint_configured,
+      fallback_mode: fallback.fallback_mode,
+      fallback_reason: fallback.fallback_reason,
+      ...usage,
+      recent_sops: recent,
+    });
+  } catch (e: any) {
+    console.error("[sops] analytics error", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "Failed to load SOP analytics" });
+  }
+});
+
+router.get("/recent-used/:clientId", optionalAuth, async (req: any, res) => {
+  try {
+    if (authReadRequired() && !req.user) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+    const clientId = String(req.params?.clientId || "").trim();
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "clientId required" });
+    }
+    return res.json({
+      ok: true,
+      clientId,
+      items: await getRecentSopUsage(clientId),
+    });
+  } catch (e: any) {
+    console.error("[sops] recent-used error", e);
+    return res
+      .status(500)
+      .json({
+        ok: false,
+        error: e?.message || "Failed to load recent SOP usage",
+      });
   }
 });
 

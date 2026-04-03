@@ -1,7 +1,12 @@
 // services/api/src/routes/sync.ts
 import { Router } from "express";
 import { query } from "../db.js";
-import { getAuthUserFromReq, type AuthUser } from "../middleware/auth.js";
+import {
+  getAuthUserFromReq,
+  hasAnyRole,
+  type AuthUser,
+} from "../middleware/auth.js";
+import { writeAudit } from "../utils/audit.js";
 import {
   getWhmcsAutoSyncConfig,
   getWhmcsAutoSyncState,
@@ -9,6 +14,7 @@ import {
 } from "../jobs/whmcsSync.js";
 
 const router = Router();
+const SYNC_ALLOWED_ROLES = ["admin", "operations", "finance", "tech"];
 
 function env(name: string, fallback = "") {
   return String(process.env[name] ?? fallback).trim();
@@ -38,14 +44,6 @@ function parseBool(value: any, fallback = false) {
   return ["1", "true", "yes", "on"].includes(v);
 }
 
-function hasAllowedRole(user: AuthUser | null) {
-  if (!user) return false;
-  const role = String(user.role || "")
-    .trim()
-    .toLowerCase();
-  return ["admin", "staff"].includes(role);
-}
-
 function isAuthorized(req: any) {
   const requiredToken = env("SYNC_ADMIN_TOKEN");
   const authHeader = String(req.headers.authorization || "");
@@ -65,7 +63,7 @@ function isAuthorized(req: any) {
   }
 
   const user = getAuthUserFromReq(req);
-  return hasAllowedRole(user);
+  return hasAnyRole(user, SYNC_ALLOWED_ROLES);
 }
 
 async function columnExists(table: string, column: string) {
@@ -95,7 +93,6 @@ async function buildSyncRunsOrderExpr() {
   return `COALESCE(${cols.join(", ")}, now())`;
 }
 
-// GET /sync/health
 router.get("/health", async (_req, res) => {
   try {
     const config = {
@@ -146,7 +143,6 @@ router.get("/health", async (_req, res) => {
   }
 });
 
-// GET /sync/whmcs/status
 router.get("/whmcs/status", async (_req, res) => {
   try {
     const orderExpr = await buildSyncRunsOrderExpr();
@@ -203,13 +199,12 @@ router.get("/whmcs/status", async (_req, res) => {
   }
 });
 
-// POST /sync/whmcs/run
-router.post("/whmcs/run", async (req, res) => {
+router.post("/whmcs/run", async (req: any, res) => {
   try {
     if (!isAuthorized(req)) {
-      return res.status(401).json({
+      return res.status(403).json({
         ok: false,
-        error: "unauthorized",
+        error: "Forbidden",
       });
     }
 
@@ -221,11 +216,28 @@ router.post("/whmcs/run", async (req, res) => {
       });
     }
 
+    const actor = getAuthUserFromReq(req);
+    const initiatedBy =
+      (actor && String(actor.email || actor.id || "").trim()) || "dashboard";
+
     const result = await runWhmcsSyncOnce({
       trigger: "manual",
-      initiatedBy:
-        (req.user && String(req.user.email || req.user.id || "")) ||
-        "dashboard",
+      initiatedBy,
+    });
+
+    await writeAudit({
+      user_id: actor?.id ? String(actor.id) : null,
+      action: "run",
+      entity: "sync",
+      entity_id: result?.runId ? String(result.runId) : null,
+      client_id: null,
+      meta: {
+        source: "whmcs",
+        trigger: "manual",
+        initiated_by: initiatedBy,
+        stats: result?.stats || null,
+      },
+      ip: req.ip,
     });
 
     return res.json({

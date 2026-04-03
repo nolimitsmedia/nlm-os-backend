@@ -69,6 +69,24 @@ type CommunicationItem = {
   created_at?: string | null;
   updated_at?: string | null;
 };
+type PromptModule =
+  | "general"
+  | "billing"
+  | "tasks"
+  | "risk"
+  | "renewals"
+  | "sop"
+  | "communications"
+  | "leadership";
+
+type AiActionSuggestion = {
+  key: string;
+  label: string;
+  description?: string;
+  action_type?: string;
+  requires_confirmation?: boolean;
+  payload?: Record<string, any> | null;
+};
 
 const router: ExpressRouter = Router();
 
@@ -1272,6 +1290,192 @@ function buildQuestionHints(question: string) {
   };
 }
 
+function detectPromptModule(
+  question: string,
+  explicitModule?: string | null,
+): PromptModule {
+  const raw = safeLower(explicitModule);
+  if (
+    [
+      "billing",
+      "tasks",
+      "risk",
+      "renewals",
+      "sop",
+      "communications",
+      "leadership",
+    ].includes(raw)
+  ) {
+    return raw as PromptModule;
+  }
+  const hints = buildQuestionHints(question || "");
+  if (hints.asksBilling) return "billing";
+  if (hints.asksRenewal) return "renewals";
+  if (hints.asksTasks) return "tasks";
+  if (hints.asksRisk) return "risk";
+  if (hints.asksCommunications) return "communications";
+  if (
+    /(sop|process|procedure|playbook|sharepoint|document)/.test(
+      safeLower(question),
+    )
+  )
+    return "sop";
+  if (
+    /(portfolio|leadership|executive|cross-client|cross client|ops digest|system)/.test(
+      safeLower(question),
+    )
+  )
+    return "leadership";
+  return "general";
+}
+
+function buildPromptPreset(moduleName: PromptModule) {
+  const presets: Record<PromptModule, string> = {
+    general:
+      "Answer directly, then explain the main drivers, risks, and recommended next steps.",
+    billing:
+      "Focus on invoices, balance due, MRR, collections posture, billing leakage risk, and specific payment follow-up recommendations.",
+    tasks:
+      "Focus on open work, blockers, overdue deliverables, owners, and what should be actioned next.",
+    risk: "Focus on churn risk, service delivery risk, negative signals, and the clearest reasons behind the current risk posture.",
+    renewals:
+      "Focus on upcoming renewals, renewal value, next due dates, retention risk, and renewal outreach recommendations.",
+    sop: "Focus on SOP coverage, missing process references, execution consistency, and recommended SOP usage or documentation actions.",
+    communications:
+      "Focus on communication history, open follow-ups, sentiment, needs-response items, and who should respond next.",
+    leadership:
+      "Focus on cross-client trends, top risk accounts, billing leakage, overdue work, renewal pipeline, and portfolio-level priorities.",
+  };
+  return presets[moduleName] || presets.general;
+}
+
+function buildConfidenceMeta(args: {
+  sources: InsightSource[];
+  usingAnthropic: boolean;
+  cached?: boolean;
+  providerAvailable?: boolean;
+}) {
+  const available = (args.sources || []).filter(
+    (item) => item?.available !== false,
+  );
+  const avg = available.length
+    ? available.reduce(
+        (sum, item) => sum + clamp(Number(item?.confidence ?? 0.75), 0, 1),
+        0,
+      ) / available.length
+    : 0.72;
+  let score = avg;
+  if (args.cached) score += 0.02;
+  if (!args.usingAnthropic) score -= 0.08;
+  if (args.providerAvailable === false) score -= 0.05;
+  const confidenceScore = clamp(Math.round(score * 100), 35, 99);
+  const confidenceLabel =
+    confidenceScore >= 88 ? "high" : confidenceScore >= 72 ? "medium" : "low";
+  return { confidenceScore, confidenceLabel };
+}
+
+function buildClientActionSuggestions(args: {
+  clientId: string;
+  clientLabel: string;
+  reply: string;
+  nextActions: string[];
+  riskBand: string;
+  modulePreset: PromptModule;
+}): AiActionSuggestion[] {
+  const emailBody = [
+    `Subject: ${args.clientLabel} follow-up`,
+    "",
+    args.reply,
+    "",
+    "Recommended actions:",
+    ...(args.nextActions || [])
+      .slice(0, 4)
+      .map((item, index) => `${index + 1}. ${item}`),
+  ].join("\n");
+
+  return [
+    {
+      key: "copy-note",
+      label: "Copy to note",
+      description: "Copy this answer for notes or internal documentation.",
+      action_type: "copy_note",
+      requires_confirmation: false,
+      payload: { text: args.reply },
+    },
+    {
+      key: "copy-email",
+      label: "Copy to email",
+      description:
+        "Prepare this answer as the basis for a client-facing email.",
+      action_type: "copy_email",
+      requires_confirmation: false,
+      payload: { text: emailBody },
+    },
+    {
+      key: "create-task",
+      label: "Create task from answer",
+      description: "Turn this answer into a follow-up task after confirmation.",
+      action_type: "create_task",
+      requires_confirmation: true,
+      payload: {
+        clientId: args.clientId,
+        title: `${args.clientLabel}: ${args.modulePreset === "general" ? "AI follow-up" : `${args.modulePreset} follow-up`}`,
+        description: [
+          args.reply,
+          "",
+          "Recommended actions:",
+          ...(args.nextActions || [])
+            .slice(0, 4)
+            .map((item, index) => `${index + 1}. ${item}`),
+        ].join("\n"),
+        riskBand: args.riskBand,
+      },
+    },
+  ];
+}
+
+function buildGlobalActionSuggestions(
+  reply: string,
+  nextActions: string[],
+): AiActionSuggestion[] {
+  return [
+    {
+      key: "copy-note",
+      label: "Copy to note",
+      description: "Copy this portfolio summary for leadership notes.",
+      action_type: "copy_note",
+      requires_confirmation: false,
+      payload: { text: reply },
+    },
+    {
+      key: "copy-email",
+      label: "Copy to email",
+      description: "Prepare this portfolio summary as an email draft.",
+      action_type: "copy_email",
+      requires_confirmation: false,
+      payload: {
+        text: [
+          reply,
+          "",
+          "Recommended actions:",
+          ...(nextActions || [])
+            .slice(0, 5)
+            .map((item, index) => `${index + 1}. ${item}`),
+        ].join("\n"),
+      },
+    },
+    {
+      key: "open-clients",
+      label: "Open client portfolio",
+      description:
+        "Review the client list and drill into the highest priority accounts.",
+      action_type: "open_clients",
+      requires_confirmation: true,
+      payload: null,
+    },
+  ];
+}
+
 function buildFallbackReply(args: {
   clientLabel: string;
   clientStatus: string;
@@ -1390,6 +1594,7 @@ async function askAnthropic(input: {
   question: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   context: any;
+  modulePreset?: PromptModule;
 }) {
   const apiKey = env("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
@@ -1404,6 +1609,8 @@ async function askAnthropic(input: {
     "Always provide practical, business-focused answers with clear reasoning.",
     "When relevant, structure the answer with concise markdown sections such as Direct Answer, Client Health, Billing Intelligence, Communications Timeline, Renewal Forecast, Risks, Opportunities, and Recommended Actions.",
     "Prefer concise but useful answers, and directly answer the user's latest question before expanding.",
+    "Include a short source attribution block that names the datasets you relied on, plus a confidence note when it materially helps the user trust the answer.",
+    `Current answer preset: ${buildPromptPreset(input.modulePreset || "general")}`,
   ].join(" ");
 
   const historyText = input.history.length
@@ -1639,6 +1846,42 @@ async function getGlobalTaskSignals() {
   }
 }
 
+async function getGlobalSopGapSignals() {
+  try {
+    await ensureTasksTable();
+    const taskColumns = await columnsFor("tasks");
+    const hasStatus = taskColumns.has("status");
+    const hasSopId = taskColumns.has("sop_id");
+    const hasSopTitle = taskColumns.has("sop_title");
+    const hasSopUrl = taskColumns.has("sop_url");
+
+    const openExpr = `LOWER(COALESCE(${hasStatus ? "status" : "'open'"}, '')) NOT IN ('done','closed','complete','completed','resolved','cancelled')`;
+    const sopLinkedExpr = `(
+      ${hasSopId ? "NULLIF(TRIM(COALESCE(sop_id::text, '')), '') IS NOT NULL" : "FALSE"}
+      OR ${hasSopTitle ? "NULLIF(TRIM(COALESCE(sop_title::text, '')), '') IS NOT NULL" : "FALSE"}
+      OR ${hasSopUrl ? "NULLIF(TRIM(COALESCE(sop_url::text, '')), '') IS NOT NULL" : "FALSE"}
+    )`;
+
+    const r = await query<DbRow>(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE ${openExpr})::int AS open_tasks,
+        COUNT(*) FILTER (WHERE ${openExpr} AND NOT ${sopLinkedExpr})::int AS no_sop_tasks,
+        COUNT(*) FILTER (WHERE ${openExpr} AND ${sopLinkedExpr})::int AS sop_linked_tasks
+      FROM tasks
+      `,
+    );
+
+    return {
+      open_tasks: toNum(r.rows[0]?.open_tasks),
+      no_sop_tasks: toNum(r.rows[0]?.no_sop_tasks),
+      sop_linked_tasks: toNum(r.rows[0]?.sop_linked_tasks),
+    };
+  } catch {
+    return { open_tasks: 0, no_sop_tasks: 0, sop_linked_tasks: 0 };
+  }
+}
+
 async function getGlobalTicketSignals() {
   try {
     const ticketTable = await firstExistingTable([
@@ -1692,6 +1935,10 @@ async function getGlobalTicketSignals() {
 async function getGlobalCommunicationsSignals() {
   try {
     await ensureCommunicationsTable();
+    const commColumns = await columnsFor("communications_timeline");
+    const hasFollowUpDueAt = commColumns.has("follow_up_due_at");
+    const hasNeedsResponse = commColumns.has("needs_response");
+
     const r = await query<DbRow>(
       `
       SELECT
@@ -1704,7 +1951,14 @@ async function getGlobalCommunicationsSignals() {
         )::int AS urgent,
         COUNT(*) FILTER (
           WHERE LOWER(COALESCE(sentiment, '')) IN ('negative','at-risk','risk','frustrated')
-        )::int AS negative
+        )::int AS negative,
+        COUNT(*) FILTER (
+          WHERE ${hasFollowUpDueAt ? "follow_up_due_at IS NOT NULL AND follow_up_due_at < NOW()" : "FALSE"}
+            AND LOWER(COALESCE(status, '')) NOT IN ('closed','resolved','done','completed')
+        )::int AS overdue_followups,
+        COUNT(*) FILTER (
+          WHERE ${hasNeedsResponse ? "COALESCE(needs_response, FALSE)" : "LOWER(COALESCE(status, '')) IN ('needs-response','needs response')"}
+        )::int AS needs_response
       FROM communications_timeline
       `,
     );
@@ -1713,10 +1967,109 @@ async function getGlobalCommunicationsSignals() {
       unresolved: toNum(r.rows[0]?.unresolved),
       urgent: toNum(r.rows[0]?.urgent),
       negative: toNum(r.rows[0]?.negative),
+      overdue_followups: toNum(r.rows[0]?.overdue_followups),
+      needs_response: toNum(r.rows[0]?.needs_response),
     };
   } catch {
-    return { total: 0, unresolved: 0, urgent: 0, negative: 0 };
+    return {
+      total: 0,
+      unresolved: 0,
+      urgent: 0,
+      negative: 0,
+      overdue_followups: 0,
+      needs_response: 0,
+    };
   }
+}
+
+async function getSystemHealthSignals() {
+  await ensureAiSupportTables();
+
+  const aiProvider = env("AI_PROVIDER", "anthropic").toLowerCase();
+  const anthropicConfigured = Boolean(env("ANTHROPIC_API_KEY"));
+  const sharepointReady = safeSharePointConfiguredForAi();
+
+  let aiLogs: any[] = [];
+  try {
+    aiLogs = await fetchRecentAiLogs(50);
+  } catch {
+    aiLogs = [];
+  }
+
+  const cachedCount = Array.isArray(aiLogs)
+    ? aiLogs.filter((item: any) => Boolean(item?.cached)).length
+    : 0;
+  const liveCount = Array.isArray(aiLogs)
+    ? Math.max(aiLogs.length - cachedCount, 0)
+    : 0;
+
+  let syncFailures = 0;
+  let latestSyncStatus = "unknown";
+  try {
+    const syncRunsTable = await tableExists("sync_runs");
+    if (syncRunsTable) {
+      const syncCols = await columnsFor("sync_runs");
+      const sourceCol = syncCols.has("source") ? "source" : "NULL::text";
+      const statusCol = syncCols.has("status") ? "status" : "NULL::text";
+      const createdCol = syncCols.has("created_at")
+        ? "created_at"
+        : syncCols.has("started_at")
+          ? "started_at"
+          : "NOW()";
+
+      const runs = await query<DbRow>(
+        `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE LOWER(COALESCE(${statusCol}, '')) IN ('failed','error')
+              AND LOWER(COALESCE(${sourceCol}, '')) = 'whmcs'
+          )::int AS sync_failures,
+          MAX(${createdCol}) AS last_sync_at,
+          (
+            SELECT COALESCE(${statusCol}::text, 'unknown')
+            FROM sync_runs
+            WHERE LOWER(COALESCE(${sourceCol}, '')) = 'whmcs'
+            ORDER BY ${createdCol} DESC NULLS LAST
+            LIMIT 1
+          ) AS latest_status
+        FROM sync_runs
+        `,
+      );
+      syncFailures = toNum(runs.rows[0]?.sync_failures);
+      latestSyncStatus = String(runs.rows[0]?.latest_status || "unknown");
+    }
+  } catch {
+    syncFailures = 0;
+    latestSyncStatus = "unknown";
+  }
+
+  return {
+    ai: {
+      provider: aiProvider,
+      provider_available: aiProvider !== "anthropic" || anthropicConfigured,
+      cached_count: cachedCount,
+      live_count: liveCount,
+      status:
+        aiProvider === "anthropic"
+          ? anthropicConfigured
+            ? "available"
+            : "fallback_only"
+          : "available",
+    },
+    sharepoint: {
+      configured: sharepointReady,
+      status: sharepointReady ? "connected" : "fallback_mode",
+    },
+    sync: {
+      latest_status: latestSyncStatus,
+      failures: syncFailures,
+      healthy: !["failed", "error"].includes(safeLower(latestSyncStatus)),
+    },
+    integration_failures:
+      syncFailures +
+      (sharepointReady ? 0 : 1) +
+      (anthropicConfigured || aiProvider !== "anthropic" ? 0 : 1),
+  };
 }
 
 async function buildGlobalInsights() {
@@ -1962,6 +2315,8 @@ async function buildGlobalInsights() {
   const taskSignals = await getGlobalTaskSignals();
   const ticketSignals = await getGlobalTicketSignals();
   const communicationsSignals = await getGlobalCommunicationsSignals();
+  const sopGapSignals = await getGlobalSopGapSignals();
+  const systemSignals = await getSystemHealthSignals();
 
   const alerts: string[] = [];
   if (rows.some((row) => row.risk_score >= 65)) {
@@ -2057,15 +2412,92 @@ async function buildGlobalInsights() {
       open_tasks: taskSignals.open,
       blocked_tasks: taskSignals.blocked,
       overdue_tasks: taskSignals.overdue,
+      no_sop_tasks: sopGapSignals.no_sop_tasks,
+      sop_linked_tasks: sopGapSignals.sop_linked_tasks,
       open_tickets: ticketSignals.open,
       urgent_tickets: ticketSignals.urgent,
       stale_tickets: ticketSignals.stale,
       communication_entries: communicationsSignals.total,
       communication_open_followups: communicationsSignals.unresolved,
       communication_negative_count: communicationsSignals.negative,
+      overdue_followups: communicationsSignals.overdue_followups,
+      needs_response_count: communicationsSignals.needs_response,
+    },
+    systems: {
+      sync_health: systemSignals.sync,
+      sharepoint_status: systemSignals.sharepoint,
+      ai_status: systemSignals.ai,
+      integration_failures: systemSignals.integration_failures,
     },
     alerts,
   };
+}
+
+function buildGlobalFallbackReply(args: {
+  question: string;
+  modulePreset: PromptModule;
+  portfolio: Awaited<ReturnType<typeof buildGlobalInsights>>;
+}) {
+  const overview = args.portfolio?.overview || ({} as any);
+  const topRisk = Array.isArray(args.portfolio?.top_risk_clients)
+    ? args.portfolio.top_risk_clients.slice(0, 5)
+    : [];
+  const opportunities = Array.isArray(args.portfolio?.opportunities)
+    ? args.portfolio.opportunities.slice(0, 4)
+    : [];
+  const renewals = Array.isArray(args.portfolio?.renewals?.next)
+    ? args.portfolio.renewals.next.slice(0, 5)
+    : [];
+  const ops = args.portfolio?.operations || ({} as any);
+  const directAnswer = [
+    `Portfolio overview: ${toNum(overview.total_clients)} clients tracked, ${toNum(overview.high_risk_clients)} high-risk, ${money(overview.total_balance_due || 0)} total balance due, and ${money(overview.renewal_value_30d || 0)} renewal value expected in the next 30 days.`,
+    ops.blocked_tasks || ops.overdue_tasks
+      ? `Operational pressure: ${toNum(ops.blocked_tasks)} blocked task(s) and ${toNum(ops.overdue_tasks)} overdue task(s) are currently active.`
+      : "Operational pressure: no major blocked or overdue task concentration was detected.",
+    renewals.length
+      ? `Renewal pipeline: next upcoming accounts include ${renewals
+          .map((item: any) => item?.name)
+          .filter(Boolean)
+          .slice(0, 3)
+          .join(", ")}.`
+      : "Renewal pipeline: no near-term renewal list is currently populated.",
+  ];
+
+  return [
+    `## NLM OS Portfolio Copilot Summary`,
+    `### Direct answer`,
+    ...directAnswer,
+    "",
+    `### Top risk accounts`,
+    ...(topRisk.length
+      ? topRisk.map(
+          (item: any, index: number) =>
+            `${index + 1}. ${item?.name || item?.id} — risk ${toNum(item?.risk_score)}/100, ${money(item?.balance_due || 0)} due.`,
+        )
+      : ["1. No major high-risk accounts detected."]),
+    "",
+    `### Billing leakage and renewals`,
+    `Total balance due: ${money(overview.total_balance_due || 0)}`,
+    `Renewals due in 30 days: ${toNum(overview.renewals_due_30d)}`,
+    `Renewal value in 30 days: ${money(overview.renewal_value_30d || 0)}`,
+    "",
+    `### Operations`,
+    `Open tasks: ${toNum(ops.open_tasks)} • Blocked: ${toNum(ops.blocked_tasks)} • Overdue: ${toNum(ops.overdue_tasks)}`,
+    `Open tickets: ${toNum(ops.open_tickets)} • Urgent: ${toNum(ops.urgent_tickets)} • Stale: ${toNum(ops.stale_tickets)}`,
+    "",
+    `### Opportunity signals`,
+    ...(opportunities.length
+      ? opportunities.map((item: any, index: number) =>
+          `${index + 1}. ${item?.title || item?.key} — ${toNum(item?.count)} account(s). ${item?.description || ""}`.trim(),
+        )
+      : ["1. No major opportunity clusters detected."]),
+    "",
+    `### Recommended actions`,
+    `1. Review high-risk accounts first and confirm the owner and next step for each one.`,
+    `2. Reduce billing leakage by following up on outstanding balances and renewals due in the next 30 days.`,
+    `3. Clear blocked and overdue work before it compounds into service delivery risk.`,
+    `4. Use the AI logs and weekly digest panels to keep leadership updates traceable.`,
+  ].join("\n");
 }
 
 function row_date(value: any) {
@@ -2077,6 +2509,7 @@ router.post("/client-summary", async (req, res) => {
   const clientName = String(req.body?.clientName || "").trim();
   const status = String(req.body?.status || "").trim();
   const question = String(req.body?.question || "").trim();
+  const moduleHint = String(req.body?.moduleHint || "").trim();
   const history = normalizeHistory(req.body?.history);
 
   if (!clientId) {
@@ -2129,6 +2562,10 @@ router.post("/client-summary", async (req, res) => {
       sops,
       risk,
     });
+    const modulePreset = detectPromptModule(
+      question || "Provide a complete Client 360 summary.",
+      moduleHint,
+    );
 
     const context = {
       generated_at: new Date().toISOString(),
@@ -2225,6 +2662,8 @@ router.post("/client-summary", async (req, res) => {
       risk,
       opportunities,
       next_best_actions: nextActions,
+      module_preset: modulePreset,
+      prompt_preset: buildPromptPreset(modulePreset),
       conversation_history: history,
     };
 
@@ -2300,6 +2739,16 @@ router.post("/client-summary", async (req, res) => {
         ...(cachedPayload as any),
         ok: true,
         clientId,
+        action_suggestions:
+          (cachedPayload as any)?.action_suggestions ||
+          buildClientActionSuggestions({
+            clientId,
+            clientLabel,
+            reply: String((cachedPayload as any)?.reply || ""),
+            nextActions,
+            riskBand: risk.band,
+            modulePreset,
+          }),
         meta: {
           ...(((cachedPayload as any)?.meta || {}) as Record<string, any>),
           cached: true,
@@ -2307,6 +2756,14 @@ router.post("/client-summary", async (req, res) => {
           route: routePlan.route,
           route_reason: routePlan.reason,
           provider: routePlan.provider,
+          provider_available:
+            routePlan.provider !== "anthropic" || !!env("ANTHROPIC_API_KEY"),
+          provider_status:
+            routePlan.provider === "anthropic" && !env("ANTHROPIC_API_KEY")
+              ? "fallback_only"
+              : "available",
+          module_preset: modulePreset,
+          live_label: "cached",
         },
       });
     }
@@ -2329,6 +2786,7 @@ router.post("/client-summary", async (req, res) => {
           question: question || "Provide a complete Client 360 summary.",
           history,
           context,
+          modulePreset,
         });
 
         if (ai?.text) {
@@ -2369,6 +2827,8 @@ router.post("/client-summary", async (req, res) => {
       };
     }
 
+    const providerAvailable =
+      routePlan.provider !== "anthropic" || !!env("ANTHROPIC_API_KEY");
     const usingAnthropic =
       routePlan.provider === "anthropic" && !!env("ANTHROPIC_API_KEY");
 
@@ -2444,12 +2904,28 @@ router.post("/client-summary", async (req, res) => {
       },
     ];
 
+    const confidence = buildConfidenceMeta({
+      sources,
+      usingAnthropic,
+      cached: false,
+      providerAvailable,
+    });
+    const actionSuggestions = buildClientActionSuggestions({
+      clientId,
+      clientLabel,
+      reply,
+      nextActions,
+      riskBand: risk.band,
+      modulePreset,
+    });
+
     const payload = {
       ok: true,
       clientId,
       reply,
       sources,
       next_best_actions: nextActions,
+      action_suggestions: actionSuggestions,
       meta: {
         feature_set: [
           "billing_intelligence",
@@ -2479,6 +2955,12 @@ router.post("/client-summary", async (req, res) => {
         route: aiMeta.route || routePlan.route,
         route_reason: routePlan.reason,
         provider: aiMeta.provider || routePlan.provider,
+        provider_available: providerAvailable,
+        provider_status: providerAvailable ? "available" : "fallback_only",
+        confidence_score: confidence.confidenceScore,
+        confidence_label: confidence.confidenceLabel,
+        module_preset: modulePreset,
+        live_label: "live",
       },
       context_preview: {
         client_name: clientLabel,
@@ -2527,6 +3009,263 @@ router.post("/client-summary", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, error: e?.message || "AI summary failed" });
+  }
+});
+
+router.post("/global-summary", async (req, res) => {
+  const question =
+    String(req.body?.question || "").trim() ||
+    "Give me a portfolio-wide summary.";
+  const moduleHint = String(req.body?.moduleHint || "").trim();
+  const history = normalizeHistory(req.body?.history);
+
+  try {
+    const portfolio = await buildGlobalInsights();
+    const modulePreset = detectPromptModule(
+      question,
+      moduleHint || "leadership",
+    );
+    const context = {
+      generated_at: new Date().toISOString(),
+      module_preset: modulePreset,
+      prompt_preset: buildPromptPreset(modulePreset),
+      portfolio,
+      history,
+    };
+
+    const provider = env("AI_PROVIDER", "anthropic").toLowerCase();
+    const routePlan = chooseAiRoute({
+      provider,
+      question,
+      history,
+      context,
+      anthropicModel: env("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+    });
+
+    let reply = "";
+    let aiMeta: {
+      model?: string | null;
+      requestId?: string | null;
+      provider?: string | null;
+      route?: string | null;
+    } = { provider: routePlan.provider, route: routePlan.route };
+
+    try {
+      if (routePlan.provider === "anthropic") {
+        const aiReply = await askAnthropic({
+          clientLabel: "NLM OS Portfolio",
+          question,
+          history,
+          context,
+          modulePreset,
+        });
+        if (aiReply?.text) {
+          reply = aiReply.text;
+          aiMeta = {
+            model: aiReply.model,
+            requestId: aiReply.requestId,
+            provider: "anthropic",
+            route: routePlan.route,
+          };
+        }
+      }
+    } catch (err: any) {
+      console.error(
+        "[ai] global-summary anthropic fallback:",
+        err?.message || err,
+      );
+    }
+
+    if (!reply) {
+      reply = buildGlobalFallbackReply({ question, modulePreset, portfolio });
+      aiMeta = {
+        ...aiMeta,
+        provider: "fallback",
+        route: "fallback-rule-engine",
+      };
+    }
+
+    const sources: InsightSource[] = [
+      {
+        type: "db",
+        label: "Portfolio client snapshot",
+        confidence: 0.95,
+        count: toNum(portfolio?.overview?.total_clients),
+        available: true,
+      },
+      {
+        type: "db",
+        label: "Top risk accounts summary",
+        confidence: 0.92,
+        count: Array.isArray(portfolio?.top_risk_clients)
+          ? portfolio.top_risk_clients.length
+          : 0,
+        available: true,
+      },
+      {
+        type: "db",
+        label: "Renewal pipeline summary",
+        confidence: 0.91,
+        count: Array.isArray(portfolio?.renewals?.next)
+          ? portfolio.renewals.next.length
+          : 0,
+        available: true,
+      },
+      {
+        type: "db",
+        label: "Operations monitor",
+        confidence: 0.9,
+        available: true,
+      },
+      {
+        type: aiMeta.provider === "anthropic" ? "anthropic" : "fallback",
+        label:
+          aiMeta.provider === "anthropic"
+            ? "Anthropic Claude Messages API"
+            : "Rule-based portfolio summary",
+        confidence: aiMeta.provider === "anthropic" ? 0.88 : 0.74,
+        available: true,
+      },
+    ];
+    const providerAvailable =
+      routePlan.provider !== "anthropic" || !!env("ANTHROPIC_API_KEY");
+    const confidence = buildConfidenceMeta({
+      sources,
+      usingAnthropic: aiMeta.provider === "anthropic",
+      providerAvailable,
+      cached: false,
+    });
+    const nextActions = [
+      `Review ${toNum(portfolio?.overview?.high_risk_clients)} high-risk account(s) first.`,
+      `Work the ${money(portfolio?.overview?.total_balance_due || 0)} balance exposure and ${toNum(portfolio?.overview?.renewals_due_30d)} upcoming renewal(s).`,
+      `Reduce overdue and blocked work by checking the operations monitor and client-level task views.`,
+    ].filter(Boolean);
+    const actionSuggestions = buildGlobalActionSuggestions(reply, nextActions);
+
+    await logAiInteraction({
+      clientId: null as any,
+      userId: String((req as any)?.user?.id || ""),
+      prompt: question,
+      response: reply,
+      provider: aiMeta.provider || routePlan.provider,
+      model: aiMeta.model || routePlan.model,
+      cacheKey: null,
+      cached: false,
+      routeReason: routePlan.reason,
+      requestId: aiMeta.requestId || null,
+      meta: {
+        route: aiMeta.route || routePlan.route,
+        scope: "global",
+        source_count: sources.length,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      reply,
+      sources,
+      next_best_actions: nextActions,
+      action_suggestions: actionSuggestions,
+      meta: {
+        provider: aiMeta.provider || routePlan.provider,
+        provider_available: providerAvailable,
+        provider_status: providerAvailable ? "available" : "fallback_only",
+        confidence_score: confidence.confidenceScore,
+        confidence_label: confidence.confidenceLabel,
+        route: aiMeta.route || routePlan.route,
+        route_reason: routePlan.reason,
+        model: aiMeta.model || routePlan.model || null,
+        module_preset: modulePreset,
+        live_label: "live",
+        cached: false,
+      },
+    });
+  } catch (e: any) {
+    console.error("[ai] global-summary error", e);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to build global summary",
+    });
+  }
+});
+
+router.get("/ops-digest", async (req, res) => {
+  try {
+    const range = String(req.query?.range || "30d").trim() || "30d";
+    const portfolio = await buildGlobalInsights();
+    const topRisk = Array.isArray(portfolio?.top_risk_clients)
+      ? portfolio.top_risk_clients.slice(0, 5)
+      : [];
+    const renewals = Array.isArray(portfolio?.renewals?.next)
+      ? portfolio.renewals.next.slice(0, 5)
+      : [];
+    const opportunities = Array.isArray(portfolio?.opportunities)
+      ? portfolio.opportunities.slice(0, 4)
+      : [];
+    return res.json({
+      ok: true,
+      generated_at: new Date().toISOString(),
+      title: "Weekly AI Ops Digest",
+      range,
+      summary: `Portfolio watch for ${range}: ${toNum(portfolio?.overview?.high_risk_clients)} high-risk account(s), ${money(portfolio?.overview?.total_balance_due || 0)} balance exposure, ${toNum(portfolio?.overview?.renewals_due_30d)} renewal(s) due soon, ${toNum(portfolio?.operations?.blocked_tasks)} blocked task(s), and ${toNum((portfolio as any)?.operations?.overdue_followups)} overdue follow-up(s).`,
+      sections: [
+        {
+          label: "Executive Layer",
+          items: topRisk.length
+            ? topRisk.map(
+                (item: any) =>
+                  `${item?.name || item?.id} — risk ${toNum(item?.risk_score)}/100, ${money(item?.balance_due || 0)} due`,
+              )
+            : ["No high-risk accounts detected."],
+        },
+        {
+          label: "Operations Layer",
+          items: [
+            `${toNum((portfolio as any)?.operations?.blocked_tasks)} blocked task(s) and ${toNum((portfolio as any)?.operations?.overdue_tasks)} overdue task(s) are active.`,
+            `${toNum((portfolio as any)?.operations?.stale_tickets)} stale ticket(s) and ${toNum((portfolio as any)?.operations?.urgent_tickets)} urgent ticket(s) need review.`,
+            `${toNum((portfolio as any)?.operations?.no_sop_tasks)} open task(s) do not yet have SOP coverage.`,
+            `${toNum((portfolio as any)?.operations?.overdue_followups)} communication follow-up(s) are overdue and ${toNum((portfolio as any)?.operations?.needs_response_count)} still need response.`,
+          ],
+        },
+        {
+          label: "Renewal Pipeline",
+          items: renewals.length
+            ? renewals.map(
+                (item: any) =>
+                  `${item?.name || item?.id} — ${money(item?.renewal_value_30d || 0)} due around ${item?.next_renewal_date ? new Date(item.next_renewal_date).toLocaleDateString() : "—"}`,
+              )
+            : ["No upcoming renewals listed."],
+        },
+        {
+          label: "Systems Layer",
+          items: [
+            `Sync health: ${String((portfolio as any)?.systems?.sync_health?.latest_status || "unknown")} with ${toNum((portfolio as any)?.systems?.sync_health?.failures)} failure signal(s).`,
+            `SharePoint: ${String((portfolio as any)?.systems?.sharepoint_status?.status || "unknown")}.`,
+            `AI: ${String((portfolio as any)?.systems?.ai_status?.status || "unknown")} using ${String((portfolio as any)?.systems?.ai_status?.provider || "unknown")} with ${toNum((portfolio as any)?.systems?.ai_status?.live_count)} live and ${toNum((portfolio as any)?.systems?.ai_status?.cached_count)} cached responses.`,
+            `Integration failures: ${toNum((portfolio as any)?.systems?.integration_failures)}.`,
+          ],
+        },
+        {
+          label: "Opportunity Signals",
+          items: opportunities.length
+            ? opportunities.map((item: any) =>
+                `${item?.title || item?.key} — ${toNum(item?.count)} account(s). ${item?.description || ""}`.trim(),
+              )
+            : ["No major opportunity clusters detected."],
+        },
+      ],
+      actions: [
+        "Review high-risk accounts and confirm the next owner action for each one.",
+        "Push renewal outreach for accounts due in the next 30 days.",
+        "Clear blocked, stale, and no-SOP work before it turns into client-facing risk.",
+        "Validate sync, SharePoint, and AI system health before leadership reporting.",
+      ],
+    });
+  } catch (e: any) {
+    console.error("[ai] ops-digest error", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "Failed to build ops digest" });
   }
 });
 
@@ -2624,12 +3363,37 @@ router.get("/global-insights", async (_req, res) => {
 router.get("/logs", async (req, res) => {
   const limit = Math.max(
     1,
-    Math.min(100, Number(req.query?.limit || 50) || 50),
+    Math.min(500, Number(req.query?.limit || 50) || 50),
   );
+  const clientId = String(req.query?.clientId || "").trim();
+  const userId = String(req.query?.userId || "").trim();
+  const provider = safeLower(req.query?.provider || "");
+  const route = safeLower(req.query?.route || "");
+  const cached = safeLower(req.query?.cached || "");
 
   try {
     await ensureAiSupportTables();
-    const logs = await fetchRecentAiLogs(limit);
+    let logs = await fetchRecentAiLogs(limit);
+    if (clientId)
+      logs = logs.filter(
+        (item: any) => String(item?.client_id || "") === clientId,
+      );
+    if (userId)
+      logs = logs.filter((item: any) => String(item?.user_id || "") === userId);
+    if (provider)
+      logs = logs.filter(
+        (item: any) => safeLower(item?.provider || "") === provider,
+      );
+    if (route)
+      logs = logs.filter((item: any) =>
+        safeLower(item?.meta?.route || item?.route_reason || "").includes(
+          route,
+        ),
+      );
+    if (cached === "true")
+      logs = logs.filter((item: any) => Boolean(item?.cached));
+    if (cached === "false")
+      logs = logs.filter((item: any) => !Boolean(item?.cached));
     return res.json({ ok: true, logs });
   } catch (e: any) {
     console.error("[ai] logs error", e);
@@ -2637,6 +3401,121 @@ router.get("/logs", async (req, res) => {
       ok: false,
       error: e?.message || "Failed to load AI logs",
       logs: [],
+    });
+  }
+});
+
+router.post("/sop-recommend", async (req, res) => {
+  try {
+    const clientId = String(req.body?.clientId || "").trim();
+    const title = String(req.body?.title || "").trim();
+    const taskType = String(req.body?.taskType || "").trim();
+    if (!clientId || !title) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "clientId and title are required" });
+    }
+
+    const sopSummary = await getSopSummary(clientId);
+    const titleNeedle = safeLower(`${title} ${taskType}`);
+    const items = Array.isArray(sopSummary.items) ? sopSummary.items : [];
+    const match =
+      items.find((item: any) => {
+        const hay = safeLower(
+          `${item?.title || ""} ${item?.url || ""} ${Array.isArray(item?.tags) ? item.tags.join(" ") : ""}`,
+        );
+        return (
+          hay &&
+          ((hay.includes("backup") && titleNeedle.includes("backup")) ||
+            (hay.includes("deploy") &&
+              (titleNeedle.includes("deploy") ||
+                titleNeedle.includes("release"))) ||
+            (hay.includes("server") &&
+              (titleNeedle.includes("server") ||
+                titleNeedle.includes("hosting"))) ||
+            (hay.includes("migration") && titleNeedle.includes("migration")) ||
+            (hay.includes("domain") && titleNeedle.includes("domain")) ||
+            (hay.includes("email") && titleNeedle.includes("email")))
+        );
+      }) ||
+      items[0] ||
+      null;
+
+    const recommendation = match
+      ? {
+          id: match.id || null,
+          title: match.title || "Recommended SOP",
+          url: match.url || null,
+          source: match.source || "manual",
+        }
+      : null;
+
+    return res.json({
+      ok: true,
+      recommendation,
+      reason: recommendation
+        ? "Matched against the client’s available SOP references."
+        : "No strong SOP match found for this task yet.",
+    });
+  } catch (e: any) {
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "Failed to recommend SOP" });
+  }
+});
+
+router.post("/sop-quick-summary", async (req, res) => {
+  try {
+    const clientId = String(req.body?.clientId || "").trim();
+    const title = String(req.body?.title || "").trim();
+    if (!clientId || !title) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "clientId and title are required" });
+    }
+
+    const [sopSummary, taskSummary] = await Promise.all([
+      getSopSummary(clientId),
+      getTaskSummary(clientId),
+    ]);
+
+    const repeated = Array.isArray(taskSummary.items)
+      ? taskSummary.items.filter(
+          (item: any) => safeLower(item?.title || "") === safeLower(title),
+        ).length
+      : 0;
+
+    const recentTitles = Array.isArray(sopSummary.recent_titles)
+      ? sopSummary.recent_titles.slice(0, 3)
+      : [];
+
+    const summary = [
+      sopSummary.count
+        ? `${sopSummary.count} SOP reference${sopSummary.count === 1 ? "" : "s"} available for this client.`
+        : "No SOP references are linked for this client yet.",
+      recentTitles.length ? `Recent SOPs: ${recentTitles.join(", ")}.` : "",
+      repeated >= 2
+        ? `This task pattern appears ${repeated} times, so linking an SOP would reduce execution drift.`
+        : "",
+      !sopSummary.configured
+        ? "SharePoint is still in fallback mode, so manual SOP links remain important."
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return res.json({
+      ok: true,
+      summary,
+      repeated_task_pattern_count: repeated,
+      recent_titles: recentTitles,
+      sop_count: sopSummary.count,
+      sharepoint_fallback: !sopSummary.configured,
+    });
+  } catch (e: any) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to build SOP quick summary",
     });
   }
 });

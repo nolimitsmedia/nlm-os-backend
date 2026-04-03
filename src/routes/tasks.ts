@@ -41,6 +41,32 @@ type TasksSchemaInfo = {
   hasSopTitle: boolean;
   hasSopUrl: boolean;
   hasBillingDependency: boolean;
+  hasWorkflowState: boolean;
+  hasPriority: boolean;
+  hasChecklist: boolean;
+  hasTemplateKey: boolean;
+  hasRecurringRule: boolean;
+  hasSlaDueAt: boolean;
+  hasDependencyIds: boolean;
+  hasBillingAction: boolean;
+  hasInvoiceIssueStatus: boolean;
+  hasAutomationSource: boolean;
+};
+
+type TaskTemplateItem = {
+  label: string;
+  done?: boolean;
+  required?: boolean;
+};
+
+type TaskTemplateRecord = {
+  key: string;
+  label: string;
+  description: string;
+  workflow_state?: string;
+  checklist: TaskTemplateItem[];
+  recurring_rule?: Record<string, any> | null;
+  billing_action?: Record<string, any> | null;
 };
 
 type AttachmentMirrorResult = {
@@ -50,6 +76,139 @@ type AttachmentMirrorResult = {
   error?: string | null;
   status?: number | null;
 };
+
+const TASK_TEMPLATE_LIBRARY: TaskTemplateRecord[] = [
+  {
+    key: "client_onboarding",
+    label: "Client Onboarding",
+    description: "Standard onboarding task package for a new client.",
+    workflow_state: "intake",
+    checklist: [
+      { label: "Confirm scope and owner", required: true },
+      { label: "Create communication timeline entry", required: true },
+      { label: "Link SOP or onboarding docs", required: true },
+      { label: "Schedule kickoff / follow-up" },
+    ],
+  },
+  {
+    key: "billing_followup",
+    label: "Billing Follow-up",
+    description: "Internal billing review and follow-up workflow.",
+    workflow_state: "waiting_on_client",
+    checklist: [
+      { label: "Mark invoice issue for review", required: true },
+      { label: "Assign billing owner", required: true },
+      { label: "Request billing follow-up", required: true },
+      { label: "Track exception / suspension recommendation" },
+    ],
+    billing_action: { type: "follow_up" },
+  },
+  {
+    key: "recurring_health_check",
+    label: "Recurring Health Check",
+    description: "Repeatable client health review workflow.",
+    workflow_state: "active",
+    checklist: [
+      { label: "Review AI client summary", required: true },
+      { label: "Check overdue tasks and tickets", required: true },
+      { label: "Review communications / follow-ups", required: true },
+      { label: "Create next action tasks" },
+    ],
+    recurring_rule: { type: "monthly", interval: 1 },
+  },
+];
+
+const WORKFLOW_STATES = [
+  "intake",
+  "todo",
+  "active",
+  "in_progress",
+  "blocked",
+  "waiting_on_client",
+  "qa_review",
+  "completed",
+  "cancelled",
+];
+
+function normalizeWorkflowState(value: any) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return "active";
+  if (["in progress", "in-progress"].includes(normalized)) return "in_progress";
+  if (["waiting on client", "waiting-on-client"].includes(normalized))
+    return "waiting_on_client";
+  if (["qa", "review"].includes(normalized)) return "qa_review";
+  if (["done", "closed", "complete"].includes(normalized)) return "completed";
+  return WORKFLOW_STATES.includes(normalized) ? normalized : "active";
+}
+
+function normalizePriority(value: any) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (["urgent", "critical"].includes(normalized)) return "high";
+  if (!normalized) return "medium";
+  return normalized;
+}
+
+function normalizeJsonArray(value: any) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeJsonObject(value: any) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function buildChecklistFromTemplate(templateKey: string, incoming: any) {
+  const incomingArray = normalizeJsonArray(incoming);
+  if (incomingArray.length) return incomingArray;
+  const template = TASK_TEMPLATE_LIBRARY.find(
+    (item) => item.key === templateKey,
+  );
+  return template
+    ? template.checklist.map((item) => ({ ...item, done: false }))
+    : [];
+}
+
+function summarizeRecurringRule(rule: any) {
+  const recurring = normalizeJsonObject(rule);
+  if (!recurring) return "";
+  const type =
+    String(recurring.type || recurring.frequency || "").trim() || "custom";
+  const interval = Number(recurring.interval || 1) || 1;
+  return interval > 1 ? `Every ${interval} ${type}` : `Every ${type}`;
+}
+
+function parseDependencyIds(value: any) {
+  return normalizeJsonArray(value)
+    .map((item: any) => String(item || "").trim())
+    .filter(Boolean);
+}
+
+function getTemplateRecord(templateKey: string) {
+  return TASK_TEMPLATE_LIBRARY.find((item) => item.key === templateKey) || null;
+}
 
 async function getTasksSchemaInfo(): Promise<TasksSchemaInfo> {
   const r = await query(
@@ -77,6 +236,16 @@ async function getTasksSchemaInfo(): Promise<TasksSchemaInfo> {
     hasSopTitle: cols.has("sop_title"),
     hasSopUrl: cols.has("sop_url"),
     hasBillingDependency: cols.has("billing_dependency"),
+    hasWorkflowState: cols.has("workflow_state"),
+    hasPriority: cols.has("priority"),
+    hasChecklist: cols.has("checklist"),
+    hasTemplateKey: cols.has("template_key"),
+    hasRecurringRule: cols.has("recurring_rule"),
+    hasSlaDueAt: cols.has("sla_due_at"),
+    hasDependencyIds: cols.has("dependency_ids"),
+    hasBillingAction: cols.has("billing_action"),
+    hasInvoiceIssueStatus: cols.has("invoice_issue_status"),
+    hasAutomationSource: cols.has("automation_source"),
   };
 }
 
@@ -102,6 +271,16 @@ async function ensureTasksTable() {
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sop_title text`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sop_url text`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS billing_dependency text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_state text DEFAULT 'active'`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority text DEFAULT 'medium'`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS checklist jsonb DEFAULT '[]'::jsonb`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_key text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recurring_rule jsonb`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sla_due_at timestamptz`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS dependency_ids jsonb DEFAULT '[]'::jsonb`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS billing_action jsonb`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS invoice_issue_status text`,
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS automation_source text`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()`,
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()`,
   ];
@@ -451,6 +630,33 @@ function normalizeDbTask(row: any, schema: TasksSchemaInfo) {
     billing_dependency: schema.hasBillingDependency
       ? row.billing_dependency || null
       : null,
+    workflow_state: schema.hasWorkflowState
+      ? normalizeWorkflowState(row.workflow_state || row.status || "active")
+      : normalizeWorkflowState(row.status || "active"),
+    priority: schema.hasPriority
+      ? normalizePriority(row.priority || "medium")
+      : "medium",
+    checklist: schema.hasChecklist ? normalizeJsonArray(row.checklist) : [],
+    template_key: schema.hasTemplateKey ? row.template_key || null : null,
+    recurring_rule: schema.hasRecurringRule
+      ? normalizeJsonObject(row.recurring_rule)
+      : null,
+    recurring_summary: schema.hasRecurringRule
+      ? summarizeRecurringRule(row.recurring_rule)
+      : "",
+    sla_due_at: schema.hasSlaDueAt ? row.sla_due_at || null : null,
+    dependency_ids: schema.hasDependencyIds
+      ? parseDependencyIds(row.dependency_ids)
+      : [],
+    billing_action: schema.hasBillingAction
+      ? normalizeJsonObject(row.billing_action)
+      : null,
+    invoice_issue_status: schema.hasInvoiceIssueStatus
+      ? row.invoice_issue_status || null
+      : null,
+    automation_source: schema.hasAutomationSource
+      ? row.automation_source || null
+      : null,
   };
 }
 
@@ -698,6 +904,148 @@ function getTaskSopState(taskLike: any, hasClientSops: boolean) {
   };
 }
 
+function normalizeTaskTitleForPattern(value: any) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function taskNeedsSopPolicy(taskLike: any) {
+  const title = normalizeTaskTitleForPattern(
+    taskLike?.title || taskLike?.name || "",
+  );
+  const billingDependency = String(taskLike?.billing_dependency || "")
+    .trim()
+    .toLowerCase();
+  const keywords = [
+    "deploy",
+    "deployment",
+    "server",
+    "backup",
+    "restore",
+    "migration",
+    "integrat",
+    "dns",
+    "hosting",
+    "email setup",
+    "domain",
+    "ssl",
+    "firewall",
+    "infrastructure",
+  ];
+
+  return (
+    keywords.some((keyword) => title.includes(keyword)) ||
+    ["required", "sop_required"].includes(billingDependency)
+  );
+}
+
+async function countRepeatedTaskPattern(clientId: string, title: string) {
+  const normalized = normalizeTaskTitleForPattern(title);
+  if (!clientId || !normalized) return 0;
+
+  const r = await query(
+    `
+    SELECT COUNT(*)::int AS total
+    FROM tasks
+    WHERE client_id = $1
+      AND LOWER(REGEXP_REPLACE(COALESCE(title, ''), '[^a-zA-Z0-9\s]', ' ', 'g')) = $2
+    `,
+    [clientId, normalized],
+  ).catch(() => ({ rows: [{ total: 0 }] }) as any);
+
+  return Number(r.rows?.[0]?.total || 0);
+}
+
+async function getClientRecentSops(clientId: string, limit = 5) {
+  const r = await query(
+    `
+    SELECT id, title, url, COALESCE(source, 'manual') AS source, created_at
+    FROM sops
+    WHERE client_id = $1
+    ORDER BY created_at DESC NULLS LAST
+    LIMIT $2
+    `,
+    [clientId, limit],
+  ).catch((e: any) => {
+    if (e?.code === "42P01") return { rows: [] } as any;
+    throw e;
+  });
+
+  return Array.isArray(r.rows) ? r.rows : [];
+}
+
+async function getClientSopAnalytics(clientId: string) {
+  const result = await query(
+    `
+    SELECT
+      COUNT(*)::int AS total_tasks,
+      COUNT(*) FILTER (
+        WHERE COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NOT NULL
+      )::int AS linked_tasks,
+      COUNT(*) FILTER (
+        WHERE COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NULL
+      )::int AS no_sop_tasks
+    FROM tasks
+    WHERE client_id = $1
+    `,
+    [clientId],
+  ).catch(
+    () =>
+      ({ rows: [{ total_tasks: 0, linked_tasks: 0, no_sop_tasks: 0 }] }) as any,
+  );
+
+  const mostUsed = await query(
+    `
+    SELECT
+      COALESCE(NULLIF(TRIM(sop_title), ''), NULLIF(TRIM(sop_url), ''), 'Linked SOP') AS label,
+      COUNT(*)::int AS count
+    FROM tasks
+    WHERE client_id = $1
+      AND COALESCE(NULLIF(TRIM(COALESCE(sop_id, '')), ''), NULLIF(TRIM(COALESCE(sop_title, '')), ''), NULLIF(TRIM(COALESCE(sop_url, '')), '')) IS NOT NULL
+    GROUP BY 1
+    ORDER BY count DESC, label ASC
+    LIMIT 5
+    `,
+    [clientId],
+  ).catch(() => ({ rows: [] }) as any);
+
+  return {
+    total_tasks: Number(result.rows?.[0]?.total_tasks || 0),
+    linked_tasks: Number(result.rows?.[0]?.linked_tasks || 0),
+    no_sop_tasks: Number(result.rows?.[0]?.no_sop_tasks || 0),
+    most_used_sops: Array.isArray(mostUsed.rows) ? mostUsed.rows : [],
+  };
+}
+
+async function buildEnhancedTaskSopState(taskLike: any, clientId: string) {
+  const hasClientSops = await clientHasSops(clientId);
+  const base = getTaskSopState(taskLike, hasClientSops);
+  const policyRequired = taskNeedsSopPolicy(taskLike);
+  const repeatedCount = await countRepeatedTaskPattern(
+    clientId,
+    String(taskLike?.title || taskLike?.name || ""),
+  );
+  const analytics = await getClientSopAnalytics(clientId);
+  const recentSops = await getClientRecentSops(clientId, 5);
+
+  return {
+    ...base,
+    sop_required_by_policy: policyRequired,
+    sop_acknowledged: Boolean(taskLike?.sop_acknowledged ?? base.sop_linked),
+    sop_block_completion: policyRequired && !base.sop_linked,
+    repeated_task_pattern_count: repeatedCount,
+    repeated_task_missing_sop_warning:
+      repeatedCount >= 2 && !base.sop_linked
+        ? "This task pattern repeats often and still has no SOP linked."
+        : null,
+    recent_client_sops: recentSops,
+    sop_usage_analytics: analytics,
+  };
+}
+
 async function syncDbWithClickUp(args: {
   clientId: string;
   schema: TasksSchemaInfo;
@@ -848,6 +1196,142 @@ function buildMirrorSummary(results: AttachmentMirrorResult[]) {
     results,
   };
 }
+
+router.get("/templates", requireAuth, async (_req: any, res) => {
+  return res.json({ ok: true, templates: TASK_TEMPLATE_LIBRARY });
+});
+
+router.get("/workload", requireAuth, async (_req: any, res) => {
+  const schema = await ensureTasksTable();
+  const rows = await query(
+    `SELECT * FROM tasks ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST`,
+  ).catch(() => ({ rows: [] }) as any);
+  const normalized = (rows.rows || []).map((row: any) =>
+    normalizeDbTask(row, schema),
+  );
+  const byOwner = new Map<string, any>();
+  for (const task of normalized) {
+    const owners =
+      Array.isArray(task.assignee_ids) && task.assignee_ids.length
+        ? task.assignee_ids
+        : ["unassigned"];
+    for (const ownerId of owners) {
+      const current = byOwner.get(ownerId) || {
+        owner_id: ownerId,
+        task_count: 0,
+        blocked_count: 0,
+        overdue_count: 0,
+        waiting_count: 0,
+        clients: new Set<string>(),
+      };
+      current.task_count += 1;
+      if (String(task.workflow_state || "").trim() === "blocked")
+        current.blocked_count += 1;
+      if (
+        task.due_date &&
+        new Date(task.due_date).getTime() < Date.now() &&
+        !isClosingStatus(task.status)
+      )
+        current.overdue_count += 1;
+      if (String(task.workflow_state || "").trim() === "waiting_on_client")
+        current.waiting_count += 1;
+      if (task.client_id) current.clients.add(String(task.client_id));
+      byOwner.set(ownerId, current);
+    }
+  }
+  const items = Array.from(byOwner.values()).map((item: any) => ({
+    owner_id: item.owner_id,
+    task_count: item.task_count,
+    blocked_count: item.blocked_count,
+    overdue_count: item.overdue_count,
+    waiting_count: item.waiting_count,
+    client_count: item.clients.size,
+  }));
+  return res.json({ ok: true, items });
+});
+
+router.post("/intake", requireAuth, async (req: any, res) => {
+  const clientId = String(req.body?.clientId || "").trim();
+  const templateKey = String(req.body?.templateKey || "").trim();
+  const titlePrefix = String(req.body?.titlePrefix || "").trim();
+  const template = getTemplateRecord(templateKey);
+  if (!clientId || !template) {
+    return res
+      .status(400)
+      .json({
+        ok: false,
+        error: "clientId and valid templateKey are required",
+      });
+  }
+  const schema = await ensureTasksTable();
+  const created: any[] = [];
+  for (const item of template.checklist) {
+    const columns = ["client_id", "title", "description"];
+    const values: any[] = [
+      clientId,
+      `${titlePrefix || template.label}: ${item.label}`,
+      template.description || "",
+    ];
+    if (schema.hasStatus) {
+      columns.push("status");
+      values.push("open");
+    }
+    if (schema.hasSource) {
+      columns.push("source");
+      values.push("local");
+    }
+    if (schema.hasWorkflowState) {
+      columns.push("workflow_state");
+      values.push(normalizeWorkflowState(template.workflow_state || "intake"));
+    }
+    if (schema.hasChecklist) {
+      columns.push("checklist");
+      values.push(
+        JSON.stringify(
+          template.checklist.map((entry) => ({ ...entry, done: false })),
+        ),
+      );
+    }
+    if (schema.hasTemplateKey) {
+      columns.push("template_key");
+      values.push(template.key);
+    }
+    if (schema.hasRecurringRule) {
+      columns.push("recurring_rule");
+      values.push(
+        template.recurring_rule
+          ? JSON.stringify(template.recurring_rule)
+          : null,
+      );
+    }
+    if (schema.hasBillingAction) {
+      columns.push("billing_action");
+      values.push(
+        template.billing_action
+          ? JSON.stringify(template.billing_action)
+          : null,
+      );
+    }
+    if (schema.hasAutomationSource) {
+      columns.push("automation_source");
+      values.push("intake_form");
+    }
+    const placeholders = columns.map((col, index) => {
+      const cast = ["checklist", "recurring_rule", "billing_action"].includes(
+        col,
+      )
+        ? "::jsonb"
+        : "";
+      return `$${index + 1}${cast}`;
+    });
+    const result = await query(
+      `INSERT INTO tasks (${columns.join(", ")}) VALUES (${placeholders.join(", ")}) RETURNING *`,
+      values,
+    );
+    created.push(normalizeDbTask(result.rows[0], schema));
+  }
+  return res.json({ ok: true, tasks: created, template });
+});
 
 router.get("/assignees", requireAuth, async (req: any, res) => {
   try {
@@ -1029,9 +1513,19 @@ router.get("/", async (req, res) => {
     }
   }
 
+  const tasksWithSopState = await Promise.all(
+    tasks.map(async (task: any) => ({
+      ...task,
+      ...(await buildEnhancedTaskSopState(
+        task,
+        String(task?.client_id || clientId || "").trim(),
+      )),
+    })),
+  );
+
   res.json({
     ok: true,
-    tasks,
+    tasks: tasksWithSopState,
     provider: hasClickUp() ? "clickup" : "local",
     scope: loadAll ? "all" : clientId,
   });
@@ -1057,6 +1551,34 @@ router.post("/", requireAuth, async (req: any, res) => {
   const sopTitleInput = String(req.body?.sopTitle || "").trim();
   const sopUrlInput = String(req.body?.sopUrl || "").trim();
   const billingDependency = String(req.body?.billingDependency || "").trim();
+  const workflowState = normalizeWorkflowState(
+    req.body?.workflowState ||
+      req.body?.workflow_state ||
+      req.body?.status ||
+      "active",
+  );
+  const priority = normalizePriority(req.body?.priority || "medium");
+  const templateKey = String(req.body?.templateKey || "").trim();
+  const checklist = buildChecklistFromTemplate(
+    templateKey,
+    req.body?.checklist,
+  );
+  const recurringRule = normalizeJsonObject(
+    req.body?.recurringRule ?? req.body?.recurring_rule,
+  );
+  const slaDueAt = normalizeDueDateInput(
+    req.body?.slaDueAt ?? req.body?.sla_due_at ?? dueDate,
+  );
+  const dependencyIds = parseDependencyIds(
+    req.body?.dependencyIds ?? req.body?.dependency_ids,
+  );
+  const billingAction = normalizeJsonObject(
+    req.body?.billingAction ?? req.body?.billing_action,
+  );
+  const invoiceIssueStatus =
+    String(req.body?.invoiceIssueStatus || "").trim() || null;
+  const automationSource =
+    String(req.body?.automationSource || "").trim() || null;
 
   if (!clientId || !title) {
     return res.status(400).json({ ok: false, error: "Missing fields" });
@@ -1081,10 +1603,16 @@ router.post("/", requireAuth, async (req: any, res) => {
   const sopTitle = String(resolvedSop.sopTitle || "").trim();
   const sopUrl = String(resolvedSop.sopUrl || "").trim();
 
-  if ((await clientHasSops(clientId)) && !sopId && !sopTitle && !sopUrl) {
+  if (
+    ((await clientHasSops(clientId)) ||
+      taskNeedsSopPolicy({ title, billing_dependency: billingDependency })) &&
+    !sopId &&
+    !sopTitle &&
+    !sopUrl
+  ) {
     return res.status(400).json({
       ok: false,
-      error: "This client requires an SOP reference before task creation.",
+      error: "This task requires an SOP reference before task creation.",
     });
   }
 
@@ -1153,6 +1681,46 @@ router.post("/", requireAuth, async (req: any, res) => {
     if (schema.hasDueDate) {
       updateValues.push(clickup?.due_date || dueDate || null);
       updateSets.push(`due_date = $${updateValues.length}`);
+    }
+    if (schema.hasWorkflowState) {
+      updateValues.push(workflowState);
+      updateSets.push(`workflow_state = $${updateValues.length}`);
+    }
+    if (schema.hasPriority) {
+      updateValues.push(priority);
+      updateSets.push(`priority = $${updateValues.length}`);
+    }
+    if (schema.hasChecklist) {
+      updateValues.push(JSON.stringify(checklist));
+      updateSets.push(`checklist = $${updateValues.length}::jsonb`);
+    }
+    if (schema.hasTemplateKey) {
+      updateValues.push(templateKey || null);
+      updateSets.push(`template_key = $${updateValues.length}`);
+    }
+    if (schema.hasRecurringRule) {
+      updateValues.push(recurringRule ? JSON.stringify(recurringRule) : null);
+      updateSets.push(`recurring_rule = $${updateValues.length}::jsonb`);
+    }
+    if (schema.hasSlaDueAt) {
+      updateValues.push(slaDueAt || null);
+      updateSets.push(`sla_due_at = $${updateValues.length}`);
+    }
+    if (schema.hasDependencyIds) {
+      updateValues.push(JSON.stringify(dependencyIds));
+      updateSets.push(`dependency_ids = $${updateValues.length}::jsonb`);
+    }
+    if (schema.hasBillingAction) {
+      updateValues.push(billingAction ? JSON.stringify(billingAction) : null);
+      updateSets.push(`billing_action = $${updateValues.length}::jsonb`);
+    }
+    if (schema.hasInvoiceIssueStatus) {
+      updateValues.push(invoiceIssueStatus);
+      updateSets.push(`invoice_issue_status = $${updateValues.length}`);
+    }
+    if (schema.hasAutomationSource) {
+      updateValues.push(automationSource || "manual");
+      updateSets.push(`automation_source = $${updateValues.length}`);
     }
 
     updateValues.push(existing.id);
@@ -1249,10 +1817,50 @@ router.post("/", requireAuth, async (req: any, res) => {
     insertColumns.push("billing_dependency");
     insertValues.push(billingDependency || null);
   }
+  if (schema.hasWorkflowState) {
+    insertColumns.push("workflow_state");
+    insertValues.push(workflowState);
+  }
+  if (schema.hasPriority) {
+    insertColumns.push("priority");
+    insertValues.push(priority);
+  }
+  if (schema.hasChecklist) {
+    insertColumns.push("checklist");
+    insertValues.push(JSON.stringify(checklist));
+  }
+  if (schema.hasTemplateKey) {
+    insertColumns.push("template_key");
+    insertValues.push(templateKey || null);
+  }
+  if (schema.hasRecurringRule) {
+    insertColumns.push("recurring_rule");
+    insertValues.push(recurringRule ? JSON.stringify(recurringRule) : null);
+  }
+  if (schema.hasSlaDueAt) {
+    insertColumns.push("sla_due_at");
+    insertValues.push(slaDueAt || null);
+  }
+  if (schema.hasDependencyIds) {
+    insertColumns.push("dependency_ids");
+    insertValues.push(JSON.stringify(dependencyIds));
+  }
+  if (schema.hasBillingAction) {
+    insertColumns.push("billing_action");
+    insertValues.push(billingAction ? JSON.stringify(billingAction) : null);
+  }
+  if (schema.hasInvoiceIssueStatus) {
+    insertColumns.push("invoice_issue_status");
+    insertValues.push(invoiceIssueStatus);
+  }
+  if (schema.hasAutomationSource) {
+    insertColumns.push("automation_source");
+    insertValues.push(automationSource || "manual");
+  }
 
   const insertSql = `
     INSERT INTO tasks (${insertColumns.join(", ")})
-    VALUES (${insertValues.map((_, index) => `$${index + 1}`).join(", ")})
+    VALUES (${insertValues.map((_, index) => `$${index + 1}${["checklist", "recurring_rule", "dependency_ids", "billing_action"].includes(insertColumns[index]) ? "::jsonb" : ""}`).join(", ")})
     RETURNING *
   `;
 
@@ -1270,6 +1878,17 @@ router.post("/", requireAuth, async (req: any, res) => {
           assignee: extractAssignee(clickup) || assignee,
           assignee_ids: extractAssigneeIds(clickup) || assigneeIds,
           due_date: clickup?.due_date || dueDate || null,
+          workflow_state: workflowState,
+          priority,
+          checklist,
+          template_key: templateKey || null,
+          recurring_rule: recurringRule,
+          recurring_summary: summarizeRecurringRule(recurringRule),
+          sla_due_at: slaDueAt || null,
+          dependency_ids: dependencyIds,
+          billing_action: billingAction,
+          invoice_issue_status: invoiceIssueStatus,
+          automation_source: automationSource || "manual",
         }
       : {}),
   };
@@ -1278,7 +1897,7 @@ router.post("/", requireAuth, async (req: any, res) => {
     ok: true,
     task: {
       ...responseTask,
-      ...getTaskSopState(responseTask, await clientHasSops(clientId)),
+      ...(await buildEnhancedTaskSopState(responseTask, clientId)),
     },
   });
 });
@@ -1531,6 +2150,51 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     req.body?.billingDependency != null
       ? String(req.body.billingDependency || "").trim()
       : "";
+  const workflowStateRaw =
+    req.body?.workflowState != null || req.body?.workflow_state != null
+      ? String(req.body?.workflowState || req.body?.workflow_state || "").trim()
+      : "";
+  const priorityRaw =
+    req.body?.priority != null ? String(req.body.priority || "").trim() : "";
+  const templateKey =
+    req.body?.templateKey != null
+      ? String(req.body.templateKey || "").trim()
+      : "";
+  const checklistInput =
+    req.body?.checklist != null
+      ? buildChecklistFromTemplate(
+          templateKey || String((req as any)?.body?.templateKey || ""),
+          req.body.checklist,
+        )
+      : null;
+  const recurringRuleInput =
+    req.body?.recurringRule != null || req.body?.recurring_rule != null
+      ? normalizeJsonObject(req.body?.recurringRule ?? req.body?.recurring_rule)
+      : null;
+  const slaDueAtInput =
+    req.body?.slaDueAt != null || req.body?.sla_due_at != null
+      ? normalizeDueDateInput(req.body?.slaDueAt ?? req.body?.sla_due_at)
+      : null;
+  const dependencyIdsInput =
+    req.body?.dependencyIds != null || req.body?.dependency_ids != null
+      ? parseDependencyIds(req.body?.dependencyIds ?? req.body?.dependency_ids)
+      : null;
+  const billingActionInput =
+    req.body?.billingAction != null || req.body?.billing_action != null
+      ? normalizeJsonObject(req.body?.billingAction ?? req.body?.billing_action)
+      : null;
+  const invoiceIssueStatusInput =
+    req.body?.invoiceIssueStatus != null
+      ? String(req.body.invoiceIssueStatus || "").trim()
+      : "";
+  const automationSourceInput =
+    req.body?.automationSource != null
+      ? String(req.body.automationSource || "").trim()
+      : "";
+  const sopAcknowledged =
+    req.body?.sopAcknowledged != null
+      ? Boolean(req.body.sopAcknowledged)
+      : false;
 
   if (!id) {
     return res.status(400).json({ ok: false, error: "id is required" });
@@ -1565,6 +2229,44 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     Array.isArray(req.body?.assigneeIds) || req.body?.assigneeId !== undefined
       ? assigneeIds
       : extractAssigneeIds(task);
+  const nextWorkflowState = workflowStateRaw
+    ? normalizeWorkflowState(workflowStateRaw)
+    : normalizeWorkflowState(task?.workflow_state || task?.status || "active");
+  const nextPriority = priorityRaw
+    ? normalizePriority(priorityRaw)
+    : normalizePriority(task?.priority || "medium");
+  const nextTemplateKey =
+    req.body?.templateKey !== undefined
+      ? templateKey
+      : String(task?.template_key || "").trim();
+  const nextChecklist =
+    checklistInput !== null
+      ? checklistInput
+      : buildChecklistFromTemplate(nextTemplateKey, task?.checklist);
+  const nextRecurringRule =
+    recurringRuleInput !== null
+      ? recurringRuleInput
+      : normalizeJsonObject(task?.recurring_rule);
+  const nextSlaDueAt =
+    slaDueAtInput !== null
+      ? slaDueAtInput
+      : normalizeDueDateInput(task?.sla_due_at || task?.due_date);
+  const nextDependencyIds =
+    dependencyIdsInput !== null
+      ? dependencyIdsInput
+      : parseDependencyIds(task?.dependency_ids);
+  const nextBillingAction =
+    billingActionInput !== null
+      ? billingActionInput
+      : normalizeJsonObject(task?.billing_action);
+  const nextInvoiceIssueStatus =
+    req.body?.invoiceIssueStatus !== undefined
+      ? invoiceIssueStatusInput || null
+      : task?.invoice_issue_status || null;
+  const nextAutomationSource =
+    req.body?.automationSource !== undefined
+      ? automationSourceInput || null
+      : task?.automation_source || null;
 
   const nextClientId =
     req.body?.clientId !== undefined
@@ -1597,7 +2299,12 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
   const sopUrl = String(resolvedSop.sopUrl || "").trim();
 
   if (
-    (await clientHasSops(nextClientId)) &&
+    ((await clientHasSops(nextClientId)) ||
+      taskNeedsSopPolicy({
+        title: nextTitle,
+        billing_dependency:
+          billingDependency || String(task?.billing_dependency || "").trim(),
+      })) &&
     !(
       sopId ||
       task?.sop_id ||
@@ -1609,7 +2316,7 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
   ) {
     return res.status(400).json({
       ok: false,
-      error: "This client requires an SOP reference before saving the task.",
+      error: "This task requires an SOP reference before saving the task.",
     });
   }
 
@@ -1618,6 +2325,25 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     : String(task?.client_name || "").trim();
 
   const billingBlockInfo = await getClientBillingBlockInfo(nextClientId);
+  const requiresSopBeforeClose = taskNeedsSopPolicy({
+    title: nextTitle,
+    billing_dependency:
+      billingDependency || String(task?.billing_dependency || "").trim(),
+  });
+  const hasResolvedSop = Boolean(sopId || sopTitle || sopUrl);
+  if (
+    isClosingStatus(nextStatus) &&
+    requiresSopBeforeClose &&
+    !hasResolvedSop &&
+    !sopAcknowledged
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "SOP required before completing this task. Link an SOP or acknowledge the SOP requirement first.",
+      code: "SOP_REQUIRED",
+    });
+  }
   if (isClosingStatus(nextStatus) && billingBlockInfo.blocked) {
     return res.status(400).json({
       ok: false,
@@ -1732,6 +2458,46 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
           : task?.billing_dependency || null),
     );
   }
+  if (schema.hasWorkflowState) {
+    updateSets.push(`workflow_state = $${values.length + 1}`);
+    values.push(nextWorkflowState);
+  }
+  if (schema.hasPriority) {
+    updateSets.push(`priority = $${values.length + 1}`);
+    values.push(nextPriority);
+  }
+  if (schema.hasChecklist) {
+    updateSets.push(`checklist = $${values.length + 1}::jsonb`);
+    values.push(JSON.stringify(nextChecklist));
+  }
+  if (schema.hasTemplateKey) {
+    updateSets.push(`template_key = $${values.length + 1}`);
+    values.push(nextTemplateKey || null);
+  }
+  if (schema.hasRecurringRule) {
+    updateSets.push(`recurring_rule = $${values.length + 1}::jsonb`);
+    values.push(nextRecurringRule ? JSON.stringify(nextRecurringRule) : null);
+  }
+  if (schema.hasSlaDueAt) {
+    updateSets.push(`sla_due_at = $${values.length + 1}`);
+    values.push(nextSlaDueAt || null);
+  }
+  if (schema.hasDependencyIds) {
+    updateSets.push(`dependency_ids = $${values.length + 1}::jsonb`);
+    values.push(JSON.stringify(nextDependencyIds));
+  }
+  if (schema.hasBillingAction) {
+    updateSets.push(`billing_action = $${values.length + 1}::jsonb`);
+    values.push(nextBillingAction ? JSON.stringify(nextBillingAction) : null);
+  }
+  if (schema.hasInvoiceIssueStatus) {
+    updateSets.push(`invoice_issue_status = $${values.length + 1}`);
+    values.push(nextInvoiceIssueStatus);
+  }
+  if (schema.hasAutomationSource) {
+    updateSets.push(`automation_source = $${values.length + 1}`);
+    values.push(nextAutomationSource);
+  }
 
   values.push(task.id);
 
@@ -1764,6 +2530,17 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
       (billingBlockInfo.blocked
         ? billingBlockInfo.reason || "Billing dependency unresolved"
         : task?.billing_dependency || null),
+    workflow_state: nextWorkflowState,
+    priority: nextPriority,
+    checklist: nextChecklist,
+    template_key: nextTemplateKey || null,
+    recurring_rule: nextRecurringRule,
+    recurring_summary: summarizeRecurringRule(nextRecurringRule),
+    sla_due_at: nextSlaDueAt || null,
+    dependency_ids: nextDependencyIds,
+    billing_action: nextBillingAction,
+    invoice_issue_status: nextInvoiceIssueStatus,
+    automation_source: nextAutomationSource,
     ...(updatedClickUp
       ? {
           status: nextStatus,
@@ -1800,9 +2577,22 @@ router.patch("/:id/status", requireAuth, async (req: any, res) => {
     return res.status(404).json({ ok: false, error: "Task not found" });
   }
 
-  const billingBlockInfo = await getClientBillingBlockInfo(
-    String(task?.client_id || "").trim(),
-  );
+  const clientTaskId = String(task?.client_id || "").trim();
+  const billingBlockInfo = await getClientBillingBlockInfo(clientTaskId);
+  const enhancedSopState = await buildEnhancedTaskSopState(task, clientTaskId);
+  if (
+    isClosingStatus(status) &&
+    enhancedSopState.sop_required_by_policy &&
+    !enhancedSopState.sop_linked &&
+    !Boolean(req.body?.sopAcknowledged)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "SOP required before completing this task. Link an SOP or acknowledge the SOP requirement first.",
+      code: "SOP_REQUIRED",
+    });
+  }
   if (isClosingStatus(status) && billingBlockInfo.blocked) {
     return res.status(400).json({
       ok: false,
@@ -1847,10 +2637,10 @@ router.patch("/:id/status", requireAuth, async (req: any, res) => {
     ok: true,
     task: {
       ...responseTask,
-      ...getTaskSopState(
+      ...(await buildEnhancedTaskSopState(
         responseTask,
-        await clientHasSops(String(task?.client_id || "").trim()),
-      ),
+        String(task?.client_id || "").trim(),
+      )),
     },
   });
 });
@@ -1883,6 +2673,22 @@ router.delete("/:id", requireAuth, async (req: any, res) => {
   await query(`DELETE FROM tasks WHERE id = $1`, [task.id]);
 
   res.json({ ok: true, id: task.id });
+});
+
+router.get("/sop/analytics/:clientId", requireAuth, async (req: any, res) => {
+  const clientId = String(req.params?.clientId || "").trim();
+  if (!clientId) {
+    return res.status(400).json({ ok: false, error: "clientId is required" });
+  }
+
+  const analytics = await getClientSopAnalytics(clientId);
+  const recent = await getClientRecentSops(clientId, 5);
+  return res.json({
+    ok: true,
+    clientId,
+    ...analytics,
+    recent_sops: recent,
+  });
 });
 
 export default router;
