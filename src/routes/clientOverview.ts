@@ -236,23 +236,28 @@ router.get("/:id/overview", async (req, res) => {
           COALESCE(SUM(
             CASE
               WHEN COALESCE(status, '') ILIKE 'Paid' THEN 0
+              WHEN COALESCE(balance, total, 0) <= 0 THEN 0
               ELSE COALESCE(balance, total, 0)
             END
           ), 0) AS balance_due,
           COUNT(*) FILTER (
-            WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Draft', 'Overdue', 'Payment Pending'])
+            WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Overdue', 'Payment Pending'])
+              AND COALESCE(balance, total, 0) > 0
           )::int AS open_invoices,
           COUNT(*) FILTER (
             WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Overdue', 'Payment Pending'])
+              AND COALESCE(balance, total, 0) > 0
               AND date_due IS NOT NULL
               AND date_due < NOW()
           )::int AS overdue_invoices,
           MIN(date_due) FILTER (
             WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Overdue', 'Payment Pending'])
+              AND COALESCE(balance, total, 0) > 0
               AND date_due IS NOT NULL
           ) AS oldest_open_due_date,
           MAX(date_due) FILTER (
-            WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Draft', 'Overdue', 'Payment Pending'])
+            WHERE COALESCE(status, '') ILIKE ANY (ARRAY['Unpaid', 'Overdue', 'Payment Pending'])
+              AND COALESCE(balance, total, 0) > 0
           ) AS latest_due_date
         FROM whmcs_invoices_cache
         WHERE whmcs_client_id = $1
