@@ -13,6 +13,7 @@ import sopsRouter from "./routes/sops.js";
 import authRouter from "./routes/auth.js";
 import sharepointRouter from "./routes/sharepoint.js";
 import auditRouter from "./routes/audit.js";
+import notificationsRouter from "./routes/notifications.js";
 
 import { startWhmcsAutoSync } from "./jobs/whmcsSync.js";
 
@@ -38,6 +39,7 @@ app.use("/sharepoint", sharepointRouter);
 app.use("/sops", sopsRouter);
 app.use("/auth", authRouter);
 app.use("/audit", auditRouter);
+app.use("/notifications", notificationsRouter);
 
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error("[server] unhandled:", err);

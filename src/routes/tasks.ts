@@ -17,8 +17,14 @@ import {
   listClickUpAssignees,
   updateClickUpTask,
   updateClickUpTaskStatus,
+  buildClickUpTaskUrl,
 } from "../integrations/clickup.js";
 import { isSharePointConfigured } from "../integrations/sharepoint.js";
+import {
+  sendTaskShareEmail,
+  sendTaskAssignedEmail,
+} from "../services/email.js";
+import { createNotification } from "./notifications.js";
 
 const router = Router();
 const upload = multer({
@@ -129,6 +135,176 @@ const WORKFLOW_STATES = [
   "completed",
   "cancelled",
 ];
+
+function buildTaskAppLink(task: any) {
+  const base =
+    String(process.env.APP_URL || process.env.FRONTEND_URL || "").trim() || "";
+  const clientId = String(task?.client_id || "").trim();
+  const taskId = String(task?.id || task?.clickup_task_id || "").trim();
+  if (!clientId || !taskId) return "";
+  const path = `/clients/${encodeURIComponent(clientId)}/tasks?task=${encodeURIComponent(taskId)}`;
+  return base ? `${base.replace(/\/$/, "")}${path}` : path;
+}
+
+function normalizeEmail(value: any) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function extractEmailsFromAssigneeLabel(value: any) {
+  const raw = String(value || "");
+  const matches = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
+  return Array.from(
+    new Set(
+      (matches || []).map((item) => normalizeEmail(item)).filter(Boolean),
+    ),
+  );
+}
+
+async function findAdminsByEmails(emails: string[]) {
+  const unique = Array.from(
+    new Set((emails || []).map((item) => normalizeEmail(item)).filter(Boolean)),
+  );
+  if (!unique.length) return [];
+  const result = await query(
+    `
+    SELECT id, email, name, role
+    FROM public.admins
+    WHERE LOWER(TRIM(email)) = ANY($1::text[])
+    `,
+    [unique],
+  ).catch(() => ({ rows: [] }));
+  return Array.isArray((result as any)?.rows) ? (result as any).rows : [];
+}
+
+async function resolveAssignmentTargets(args: {
+  assigneeIds?: string[];
+  assigneeLabel?: string;
+  assigneeEmail?: string;
+}) {
+  const ids = Array.isArray(args.assigneeIds)
+    ? args.assigneeIds
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    : [];
+  let clickupAssignees: any[] = [];
+  if (ids.length && hasClickUp()) {
+    try {
+      const members = await listClickUpAssignees({});
+      clickupAssignees = Array.isArray(members) ? members : [];
+    } catch {
+      clickupAssignees = [];
+    }
+  }
+  const matchedMembers = ids.length
+    ? clickupAssignees.filter((member: any) =>
+        ids.includes(String(member?.id || "").trim()),
+      )
+    : [];
+  const fallbackEmails = extractEmailsFromAssigneeLabel(args.assigneeLabel);
+  const directAssigneeEmail = normalizeEmail(args.assigneeEmail);
+  const emailPool = Array.from(
+    new Set(
+      [
+        ...matchedMembers.map((member: any) => normalizeEmail(member?.email)),
+        ...fallbackEmails,
+        directAssigneeEmail,
+      ].filter(Boolean),
+    ),
+  );
+  const admins = await findAdminsByEmails(emailPool);
+  const adminByEmail = new Map(
+    admins.map((admin: any) => [normalizeEmail(admin.email), admin]),
+  );
+  const targets = new Map<
+    string,
+    { email: string; name?: string; adminId?: string | null }
+  >();
+  for (const member of matchedMembers) {
+    const email = normalizeEmail(member?.email);
+    if (!email) continue;
+    const admin = adminByEmail.get(email);
+    targets.set(email, {
+      email,
+      name: String(
+        member?.name || member?.username || admin?.name || email,
+      ).trim(),
+      adminId: admin?.id ? String(admin.id) : null,
+    });
+  }
+  for (const email of fallbackEmails) {
+    if (targets.has(email)) continue;
+    const admin = adminByEmail.get(email);
+    targets.set(email, {
+      email,
+      name: String(admin?.name || email).trim(),
+      adminId: admin?.id ? String(admin.id) : null,
+    });
+  }
+  if (directAssigneeEmail && !targets.has(directAssigneeEmail)) {
+    const admin = adminByEmail.get(directAssigneeEmail);
+    targets.set(directAssigneeEmail, {
+      email: directAssigneeEmail,
+      name: String(admin?.name || directAssigneeEmail).trim(),
+      adminId: admin?.id ? String(admin.id) : null,
+    });
+  }
+  return Array.from(targets.values());
+}
+
+async function notifyTaskAssignees(args: {
+  task: any;
+  clientName: string;
+  actorName?: string;
+  assigneeIds?: string[];
+  assigneeLabel?: string;
+  assigneeEmail?: string;
+  reason?: "created" | "updated" | "assigned";
+}) {
+  const task = args.task || {};
+  const shareUrl = buildTaskAppLink(task);
+  const clickupUrl =
+    String(task?.url || "").trim() ||
+    buildClickUpTaskUrl(String(task?.clickup_task_id || ""));
+  const taskTitle = String(task?.title || task?.name || "Untitled Task").trim();
+  const targets = await resolveAssignmentTargets({
+    assigneeIds: args.assigneeIds,
+    assigneeLabel: args.assigneeLabel,
+    assigneeEmail: args.assigneeEmail,
+  });
+  if (!targets.length) return;
+  for (const target of targets) {
+    if (target.adminId) {
+      await createNotification({
+        userId: target.adminId,
+        kind: "task_assignment",
+        title: `Task assigned: ${taskTitle}`,
+        body: args.clientName
+          ? `Client: ${args.clientName}`
+          : "A task was assigned to you.",
+        actionUrl: shareUrl || null,
+        actionLabel: clickupUrl ? "Open task" : "Open task",
+        meta: {
+          task_id: String(task?.id || ""),
+          clickup_task_id: String(task?.clickup_task_id || ""),
+          client_id: String(task?.client_id || ""),
+          clickup_url: clickupUrl || null,
+          reason: args.reason || "assigned",
+        },
+      }).catch(() => null);
+    }
+    await sendTaskAssignedEmail({
+      to: target.email,
+      assigneeName: target.name,
+      taskTitle,
+      clientName: args.clientName,
+      assignedByName: args.actorName,
+      shareUrl: shareUrl || clickupUrl || "",
+      clickupUrl: clickupUrl || null,
+    }).catch(() => null);
+  }
+}
 
 function normalizeWorkflowState(value: any) {
   const normalized = String(value || "")
@@ -1256,12 +1432,10 @@ router.post("/intake", requireAuth, async (req: any, res) => {
   const titlePrefix = String(req.body?.titlePrefix || "").trim();
   const template = getTemplateRecord(templateKey);
   if (!clientId || !template) {
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        error: "clientId and valid templateKey are required",
-      });
+    return res.status(400).json({
+      ok: false,
+      error: "clientId and valid templateKey are required",
+    });
   }
   const schema = await ensureTasksTable();
   const created: any[] = [];
@@ -1537,6 +1711,7 @@ router.post("/", requireAuth, async (req: any, res) => {
   const description = String(req.body?.description || "").trim();
   const assignee = String(req.body?.assignee || "").trim();
   const assigneeId = String(req.body?.assigneeId || "").trim();
+  const assigneeEmail = normalizeEmail(req.body?.assigneeEmail || "");
   const assigneeIds = Array.isArray(req.body?.assigneeIds)
     ? req.body.assigneeIds
         .map((value: any) => String(value || "").trim())
@@ -1750,12 +1925,26 @@ router.post("/", requireAuth, async (req: any, res) => {
         : {}),
     };
 
+    const finalTask = {
+      ...responseTask,
+      ...getTaskSopState(responseTask, await clientHasSops(clientId)),
+    };
+
+    if (assigneeIds.length || assignee) {
+      await notifyTaskAssignees({
+        task: finalTask,
+        clientName,
+        actorName: String(req.user?.name || req.user?.email || "NLM OS").trim(),
+        assigneeIds: extractAssigneeIds(finalTask),
+        assigneeLabel: String(finalTask?.assignee || assignee || "").trim(),
+        assigneeEmail,
+        reason: "created",
+      }).catch(() => null);
+    }
+
     return res.json({
       ok: true,
-      task: {
-        ...responseTask,
-        ...getTaskSopState(responseTask, await clientHasSops(clientId)),
-      },
+      task: finalTask,
     });
   }
 
@@ -1893,12 +2082,26 @@ router.post("/", requireAuth, async (req: any, res) => {
       : {}),
   };
 
+  const finalTask = {
+    ...responseTask,
+    ...(await buildEnhancedTaskSopState(responseTask, clientId)),
+  };
+
+  if (assigneeIds.length || assignee || assigneeEmail) {
+    await notifyTaskAssignees({
+      task: finalTask,
+      clientName,
+      actorName: String(req.user?.name || req.user?.email || "NLM OS").trim(),
+      assigneeIds: extractAssigneeIds(finalTask),
+      assigneeLabel: String(finalTask?.assignee || assignee || "").trim(),
+      assigneeEmail,
+      reason: "created",
+    }).catch(() => null);
+  }
+
   res.json({
     ok: true,
-    task: {
-      ...responseTask,
-      ...(await buildEnhancedTaskSopState(responseTask, clientId)),
-    },
+    task: finalTask,
   });
 });
 
@@ -2126,6 +2329,7 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
   const description = String(req.body?.description || "").trim();
   const assignee = String(req.body?.assignee || "").trim();
   const assigneeId = String(req.body?.assigneeId || "").trim();
+  const assigneeEmail = normalizeEmail(req.body?.assigneeEmail || "");
   const assigneeIdsInput = Array.isArray(req.body?.assigneeIds)
     ? req.body.assigneeIds
     : assigneeId
@@ -2551,13 +2755,105 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
       : {}),
   };
 
+  const finalTask = {
+    ...responseTask,
+    ...getTaskSopState(responseTask, await clientHasSops(nextClientId)),
+  };
+
+  const shouldNotifyAssignee =
+    Array.isArray(req.body?.assigneeIds) ||
+    req.body?.assigneeId !== undefined ||
+    req.body?.assignee !== undefined;
+
+  if (shouldNotifyAssignee) {
+    await notifyTaskAssignees({
+      task: finalTask,
+      clientName: nextClientName,
+      actorName: String(req.user?.name || req.user?.email || "NLM OS").trim(),
+      assigneeIds: extractAssigneeIds(finalTask),
+      assigneeLabel: String(finalTask?.assignee || nextAssignee || "").trim(),
+      reason: "assigned",
+    }).catch(() => null);
+  }
+
   res.json({
     ok: true,
-    task: {
-      ...responseTask,
-      ...getTaskSopState(responseTask, await clientHasSops(nextClientId)),
-    },
+    task: finalTask,
   });
+});
+
+router.post("/:taskId/share", requireAuth, async (req: any, res) => {
+  try {
+    const taskId = String(req.params?.taskId || "").trim();
+    const email = normalizeEmail(req.body?.email);
+    const message = String(req.body?.message || "").trim();
+
+    if (!taskId || !email) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Task ID and recipient email are required" });
+    }
+
+    await ensureTasksTable();
+    const task = await findTaskByAnyId(taskId);
+    if (!task) {
+      return res.status(404).json({ ok: false, error: "Task not found" });
+    }
+
+    const clientName = await resolveClientName(String(task.client_id || ""));
+    const shareUrl =
+      String(req.body?.shareUrl || "").trim() || buildTaskAppLink(task);
+    const clickupUrl =
+      String(task?.url || "").trim() ||
+      buildClickUpTaskUrl(String(task?.clickup_task_id || ""));
+
+    const emailResult = await sendTaskShareEmail({
+      to: email,
+      taskTitle: String(task.title || task.name || "Untitled Task"),
+      clientName,
+      sharedByName: String(req.user?.name || req.user?.email || "NLM OS"),
+      shareUrl: shareUrl || clickupUrl || "",
+      message,
+    });
+
+    const recipientAdmins = await findAdminsByEmails([email]);
+    const recipientAdmin = recipientAdmins[0] || null;
+    if (recipientAdmin?.id) {
+      await createNotification({
+        userId: String(recipientAdmin.id),
+        kind: "task_share",
+        title: "A task was shared with you",
+        body: String(task.title || task.name || "Untitled Task"),
+        actionUrl: shareUrl || null,
+        actionLabel: clickupUrl ? "Open task" : "Open task",
+        meta: {
+          task_id: String(task.id || ""),
+          clickup_task_id: String(task.clickup_task_id || ""),
+          client_id: String(task.client_id || ""),
+          clickup_url: clickupUrl || null,
+          shared_by: String(req.user?.id || ""),
+        },
+      }).catch(() => null);
+    }
+
+    return res.json({
+      ok: true,
+      email_sent: Boolean(emailResult?.ok),
+      share_url: shareUrl,
+      clickup_url: clickupUrl || null,
+      task: {
+        id: String(task.id || ""),
+        clickup_task_id: String(task.clickup_task_id || "") || null,
+        client_id: String(task.client_id || "") || null,
+        title: String(task.title || task.name || "Untitled Task"),
+      },
+    });
+  } catch (e: any) {
+    console.error("[tasks share]", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "Failed to share task" });
+  }
 });
 
 router.patch("/:id/status", requireAuth, async (req: any, res) => {

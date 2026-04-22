@@ -834,3 +834,10 @@ export const clickupCreateTask = async (args: {
   clientName?: string;
   assigneeIds?: (string | number)[];
 }) => createClickUpTask(args);
+
+export function buildClickUpTaskUrl(taskId: string) {
+  const normalized = String(taskId || "").trim();
+  return normalized
+    ? `https://app.clickup.com/t/${encodeURIComponent(normalized)}`
+    : "";
+}
