@@ -5,11 +5,7 @@ import { query } from "../db.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { writeAudit } from "../utils/audit.js";
 import { verifyPassword, hashPassword } from "../utils/password.js";
-import {
-  sendInviteEmail,
-  sendPasswordResetEmail,
-  sendPasswordResetEmail,
-} from "../services/email.js";
+import { sendInviteEmail, sendPasswordResetEmail } from "../services/email.js";
 import { createNotification } from "./notifications.js";
 
 const router = Router();
