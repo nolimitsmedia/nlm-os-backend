@@ -45,8 +45,10 @@ function boolEnv(name: string, fallback = false) {
 
 function buildPublicLink(path: string, token: string) {
   const appUrl = env("APP_URL") || env("FRONTEND_URL") || env("WEB_URL");
-  const suffix = `${path}?token=${encodeURIComponent(token)}`;
-  if (appUrl) return `${appUrl.replace(/\/$/, "")}${suffix}`;
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  const suffix = `#${cleanPath}?token=${encodeURIComponent(token)}`;
+
+  if (appUrl) return `${appUrl.replace(/\/$/, "")}/${suffix}`;
   return suffix;
 }
 
