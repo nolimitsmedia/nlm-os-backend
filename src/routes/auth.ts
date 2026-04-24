@@ -45,10 +45,8 @@ function boolEnv(name: string, fallback = false) {
 
 function buildPublicLink(path: string, token: string) {
   const appUrl = env("APP_URL") || env("FRONTEND_URL") || env("WEB_URL");
-  const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  const suffix = `#${cleanPath}?token=${encodeURIComponent(token)}`;
-
-  if (appUrl) return `${appUrl.replace(/\/$/, "")}/${suffix}`;
+  const suffix = `${path}?token=${encodeURIComponent(token)}`;
+  if (appUrl) return `${appUrl.replace(/\/$/, "")}${suffix}`;
   return suffix;
 }
 
@@ -474,6 +472,277 @@ router.post("/admins/update", requireAuth, async (req: any, res) => {
     return res.status(500).json({ ok: false, error: pickErr(e) });
   }
 });
+
+router.get(
+  "/admins",
+  requireAuth,
+  requireRole(["admin"]),
+  async (_req: any, res) => {
+    try {
+      await ensureAdminsTable();
+
+      const r = await query(
+        `SELECT id,email,name,role,is_active,created_at,updated_at
+         FROM public.admins
+         ORDER BY created_at DESC, name ASC`,
+      );
+
+      return res.json({ ok: true, items: r.rows || [] });
+    } catch (e) {
+      console.error("[auth admins list]", e);
+      return res.status(500).json({ ok: false, error: pickErr(e) });
+    }
+  },
+);
+
+router.patch(
+  "/admins/:id",
+  requireAuth,
+  requireRole(["admin"]),
+  async (req: any, res) => {
+    try {
+      await ensureAdminsTable();
+
+      const adminId = String(req.params?.id || "").trim();
+      const actorId = String(req.user?.id || "").trim();
+
+      if (!adminId) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Admin ID is required" });
+      }
+
+      const name =
+        req.body?.name !== undefined
+          ? String(req.body.name || "").trim()
+          : undefined;
+      const email =
+        req.body?.email !== undefined ? normEmail(req.body.email) : undefined;
+      const role =
+        req.body?.role !== undefined
+          ? String(req.body.role || "")
+              .trim()
+              .toLowerCase()
+          : undefined;
+      const isActive =
+        req.body?.is_active !== undefined
+          ? Boolean(req.body.is_active)
+          : undefined;
+
+      const allowedRoles = [
+        "admin",
+        "operations",
+        "finance",
+        "tech",
+        "staff",
+        "viewer",
+      ];
+
+      if (role !== undefined && !allowedRoles.includes(role)) {
+        return res.status(400).json({ ok: false, error: "Invalid role" });
+      }
+      if (name !== undefined && !name) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Full name is required" });
+      }
+      if (email !== undefined && !email) {
+        return res.status(400).json({ ok: false, error: "Email is required" });
+      }
+
+      const existing = await query(
+        `SELECT id,email,name,role,is_active
+         FROM public.admins
+         WHERE id = $1
+         LIMIT 1`,
+        [adminId],
+      );
+
+      const current = existing.rows?.[0];
+      if (!current) {
+        return res.status(404).json({ ok: false, error: "User not found" });
+      }
+
+      if (email && email !== String(current.email || "").toLowerCase()) {
+        const duplicate = await query(
+          `SELECT id FROM public.admins
+           WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
+             AND id <> $2
+           LIMIT 1`,
+          [email, adminId],
+        );
+
+        if (duplicate.rows.length) {
+          return res
+            .status(409)
+            .json({ ok: false, error: "Email is already in use" });
+        }
+      }
+
+      if (isActive === false && adminId === actorId) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "You cannot deactivate your own account" });
+      }
+
+      if (
+        isActive === false ||
+        (role !== undefined && current.role === "admin" && role !== "admin")
+      ) {
+        const activeAdmins = await query(
+          `SELECT COUNT(*)::int AS n
+           FROM public.admins
+           WHERE role = 'admin'
+             AND is_active = true
+             AND id <> $1`,
+          [adminId],
+        );
+
+        if (Number(activeAdmins.rows?.[0]?.n || 0) < 1) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error: "At least one active admin must remain",
+            });
+        }
+      }
+
+      const sets: string[] = [];
+      const vals: any[] = [];
+      let i = 1;
+
+      if (name !== undefined) {
+        sets.push(`name = $${i++}`);
+        vals.push(name);
+      }
+      if (email !== undefined) {
+        sets.push(`email = $${i++}`);
+        vals.push(email);
+      }
+      if (role !== undefined) {
+        sets.push(`role = $${i++}`);
+        vals.push(role);
+      }
+      if (isActive !== undefined) {
+        sets.push(`is_active = $${i++}`);
+        vals.push(isActive);
+      }
+
+      if (!sets.length) {
+        return res.status(400).json({ ok: false, error: "Nothing to update" });
+      }
+
+      sets.push(`updated_at = NOW()`);
+      vals.push(adminId);
+
+      const updated = await query(
+        `UPDATE public.admins
+         SET ${sets.join(", ")}
+         WHERE id = $${i}
+         RETURNING id,email,name,role,is_active,created_at,updated_at`,
+        vals,
+      );
+
+      await writeAudit({
+        user_id: actorId || null,
+        action: "update",
+        entity: "admin_user",
+        entity_id: adminId,
+        client_id: null,
+        meta: { changed_fields: Object.keys(req.body || {}) },
+        ip: req.ip,
+      });
+
+      return res.json({ ok: true, user: updated.rows[0] });
+    } catch (e: any) {
+      console.error("[auth admins update user]", e);
+
+      if (e?.code === "23505") {
+        return res
+          .status(409)
+          .json({ ok: false, error: "Email is already in use" });
+      }
+
+      return res.status(500).json({ ok: false, error: pickErr(e) });
+    }
+  },
+);
+
+router.delete(
+  "/admins/:id",
+  requireAuth,
+  requireRole(["admin"]),
+  async (req: any, res) => {
+    try {
+      await ensureAdminsTable();
+
+      const adminId = String(req.params?.id || "").trim();
+      const actorId = String(req.user?.id || "").trim();
+
+      if (!adminId) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Admin ID is required" });
+      }
+      if (adminId === actorId) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "You cannot delete your own account" });
+      }
+
+      const existing = await query(
+        `SELECT id,email,name,role,is_active
+         FROM public.admins
+         WHERE id = $1
+         LIMIT 1`,
+        [adminId],
+      );
+
+      const current = existing.rows?.[0];
+      if (!current) {
+        return res.status(404).json({ ok: false, error: "User not found" });
+      }
+
+      if (current.role === "admin" && current.is_active) {
+        const activeAdmins = await query(
+          `SELECT COUNT(*)::int AS n
+           FROM public.admins
+           WHERE role = 'admin'
+             AND is_active = true
+             AND id <> $1`,
+          [adminId],
+        );
+
+        if (Number(activeAdmins.rows?.[0]?.n || 0) < 1) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error: "At least one active admin must remain",
+            });
+        }
+      }
+
+      await query(`DELETE FROM public.admins WHERE id = $1`, [adminId]);
+
+      await writeAudit({
+        user_id: actorId || null,
+        action: "delete",
+        entity: "admin_user",
+        entity_id: adminId,
+        client_id: null,
+        meta: { email: current.email, role: current.role, name: current.name },
+        ip: req.ip,
+      });
+
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("[auth admins delete user]", e);
+      return res.status(500).json({ ok: false, error: pickErr(e) });
+    }
+  },
+);
 
 router.post("/forgot-password", async (req, res) => {
   try {
