@@ -45,8 +45,10 @@ function boolEnv(name: string, fallback = false) {
 
 function buildPublicLink(path: string, token: string) {
   const appUrl = env("APP_URL") || env("FRONTEND_URL") || env("WEB_URL");
-  const suffix = `${path}?token=${encodeURIComponent(token)}`;
-  if (appUrl) return `${appUrl.replace(/\/$/, "")}${suffix}`;
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  const suffix = `#${cleanPath}?token=${encodeURIComponent(token)}`;
+
+  if (appUrl) return `${appUrl.replace(/\/$/, "")}/${suffix}`;
   return suffix;
 }
 
@@ -241,6 +243,12 @@ async function markIdentityTokenUsed(id: string) {
   );
 }
 
+function writeAuditLater(params: Parameters<typeof writeAudit>[0]) {
+  void writeAudit(params).catch((e: any) => {
+    console.warn("[audit] async write skipped:", e?.message || e);
+  });
+}
+
 router.post("/admins/bootstrap", async (req, res) => {
   try {
     await ensureAdminsTable();
@@ -359,7 +367,7 @@ router.post("/login", async (req, res) => {
       { expiresIn: "7d" },
     );
 
-    await writeAudit({
+    writeAuditLater({
       user_id: String(user.id || ""),
       action: "login",
       entity: "auth",
@@ -599,12 +607,10 @@ router.patch(
         );
 
         if (Number(activeAdmins.rows?.[0]?.n || 0) < 1) {
-          return res
-            .status(400)
-            .json({
-              ok: false,
-              error: "At least one active admin must remain",
-            });
+          return res.status(400).json({
+            ok: false,
+            error: "At least one active admin must remain",
+          });
         }
       }
 
@@ -715,12 +721,10 @@ router.delete(
         );
 
         if (Number(activeAdmins.rows?.[0]?.n || 0) < 1) {
-          return res
-            .status(400)
-            .json({
-              ok: false,
-              error: "At least one active admin must remain",
-            });
+          return res.status(400).json({
+            ok: false,
+            error: "At least one active admin must remain",
+          });
         }
       }
 
